@@ -1,0 +1,3 @@
+#!/bin/bash
+# Set up this CS lab PC: taskbar, mouse, check-in, exercises, Firefox. See README.md.
+exec python3 "$(dirname "$(readlink -f "$0")")/lab_start.py" "$@"
