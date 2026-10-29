@@ -622,10 +622,14 @@ def sign_in(m, url, email, password, state):
             submit(m)
             say("  password entered")
         elif kind == "number":
-            show_number(page["number"])
+            if state.get("shown") != page["number"]:   # once per code, not every poll
+                state["shown"] = page["number"]
+                show_number(page["number"])
         elif kind == "approve":
-            say("  approve the sign-in on your phone (Microsoft Authenticator)…")
-            notify("Approve the sign-in in Microsoft Authenticator")
+            if state.get("shown") != "approve":
+                state["shown"] = "approve"
+                say("  approve the sign-in on your phone (Microsoft Authenticator)…")
+                notify("Approve the sign-in in Microsoft Authenticator")
         elif kind == "kmsi":
             submit(m)   # "Stay signed in?" -> Yes (this PC forgets it on restart anyway)
             say("  'Stay signed in?' -> Yes")
