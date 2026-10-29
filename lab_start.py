@@ -60,6 +60,16 @@ EMAIL=jrk25@st-andrews.ac.uk
 PASSWORD=
 """
 
+# How to tell each site is really open and signed in: (hosts, regex on title + start of page).
+# The address alone isn't enough: right after opening, Outlook's tab still shows
+# outlook.office.com for a moment before it redirects to the login page.
+SIGNED_IN = {
+    STUDRES_URL: (("studres.cs.st-andrews.ac.uk",), r"Index of /CS1002"),
+    OUTLOOK_URL: (("outlook.office.com", "outlook.cloud.microsoft", "outlook.office365.com"),
+                  r"Mail - .+ - Outlook|Inbox - .+ - Outlook"),
+    MMS_URL: (("mms.st-andrews.ac.uk",), r"Sign out"),
+}
+
 LOGIN_HOSTS = ("login.microsoftonline.com", "login.microsoft.com", "login.live.com",
                "login.st-andrews.ac.uk", "login.windows.net", "device.login.microsoftonline.com")
 
@@ -519,7 +529,8 @@ const vis = e => {
 };
 const q = s => [...document.querySelectorAll(s)].find(vis) || null;
 const text = (document.body && document.body.innerText) || '';
-const out = {url: location.href, ready: document.readyState, kind: 'wait'};
+const out = {url: location.href, ready: document.readyState, kind: 'wait',
+             page: (document.title + ' | ' + text.slice(0, 600))};
 const err = q('#usernameError, #passwordError, #errorText, [data-testid="error"], .alert-error, #idTD_Error');
 if (err && err.innerText.trim()) { out.kind = 'error'; out.error = err.innerText.trim().slice(0, 200); return out; }
 // The password page keeps the email box in the DOM, so look for the password first.
@@ -561,8 +572,9 @@ def submit(m):
             m.js("arguments[0].click()", btn)
 
 
-def sign_in(m, target_host, email, password, state):
-    """Drive whatever login page the current tab shows until it reaches target_host."""
+def sign_in(m, url, email, password, state):
+    """Drive whatever login page the current tab shows until the site in url is open."""
+    target_hosts, signed_in_re = SIGNED_IN[url]
     deadline = time.time() + LOGIN_TIMEOUT
     last = (None, 0.0)
     while time.time() < deadline:
@@ -573,7 +585,8 @@ def sign_in(m, target_host, email, password, state):
             continue
         url = page.get("url", "")
         host = re.sub(r"^\w+://([^/]+).*$", r"\1", url)
-        if host == target_host and page.get("ready") != "loading":
+        if (host in target_hosts and page.get("ready") == "complete"
+                and re.search(signed_in_re, page.get("page", ""))):
             return True
         if host not in LOGIN_HOSTS and not host.endswith(".microsoftonline.com"):
             time.sleep(0.5)   # a redirect hop on the way
@@ -626,7 +639,7 @@ def sign_in(m, target_host, email, password, state):
                     say("  chose Microsoft Authenticator")
                     break
         time.sleep(0.7)
-    raise LoginFailed("timed out after %d s waiting for %s" % (LOGIN_TIMEOUT, target_host))
+    raise LoginFailed("timed out after %d s waiting for %s" % (LOGIN_TIMEOUT, target_hosts[0]))
 
 
 def show_number(number):
@@ -701,9 +714,8 @@ def setup_browser(login=True):
             say("  %s: %s" % (name, url))
             m.navigate(url)
             if login:
-                target = re.sub(r"^\w+://([^/]+).*$", r"\1", url)
                 try:
-                    sign_in(m, target, email, password, state)
+                    sign_in(m, url, email, password, state)
                     say("  %s: signed in" % name)
                 except LoginFailed as e:
                     say("  %s: NOT signed in – %s" % (name, e))
