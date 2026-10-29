@@ -508,15 +508,24 @@ def open_tabs_plain(urls):
 
 
 DETECT_JS = r"""
-const vis = e => !!e && e.offsetWidth > 0 && e.offsetHeight > 0 &&
-  getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).display !== 'none';
+// Microsoft keeps the inactive email/password box in the page "off screen"
+// (class moveOffScreen, tabindex -1, opacity 0) for password managers.
+const vis = e => {
+  if (!e || e.offsetWidth === 0 || e.offsetHeight === 0 || e.closest('.moveOffScreen')) return false;
+  const cs = getComputedStyle(e), r = e.getBoundingClientRect();
+  return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0' &&
+    !(e.tagName === 'INPUT' && e.tabIndex < 0) && r.right > 0 && r.bottom > 0 &&
+    r.left < innerWidth && r.top < innerHeight;
+};
 const q = s => [...document.querySelectorAll(s)].find(vis) || null;
 const text = (document.body && document.body.innerText) || '';
 const out = {url: location.href, ready: document.readyState, kind: 'wait'};
 const err = q('#usernameError, #passwordError, #errorText, [data-testid="error"], .alert-error, #idTD_Error');
 if (err && err.innerText.trim()) { out.kind = 'error'; out.error = err.innerText.trim().slice(0, 200); return out; }
+// The password page keeps the email box in the DOM, so look for the password first.
+const pw = q('input[name="passwd"], input[type="password"]');
+if (pw) { out.kind = 'password'; out.filled = !!pw.value; return out; }
 if (q('input[name="loginfmt"]')) { out.kind = 'email'; out.filled = !!q('input[name="loginfmt"]').value; return out; }
-if (q('input[name="passwd"], input[type="password"]')) { out.kind = 'password'; return out; }
 let num = q('#idRichContext_DisplaySign, #displaySign, [data-testid="displaySign"]');
 if (!num && /Authenticator|Approve sign.?in/i.test(text))
   num = [...document.querySelectorAll('div,span,p')].find(e => vis(e) && /^\s*\d{2,3}\s*$/.test(e.innerText || ''));
