@@ -26,6 +26,14 @@ gedit .env         # put your password after PASSWORD=, save
 ./start browser
 ```
 
+No `git` on the PC? Download it instead:
+
+```bash
+cd ~/Documents
+curl -sL https://github.com/JackRubiralta/cs_lab_start/archive/refs/heads/main.tar.gz | tar xz
+mv cs_lab_start-main cs_lab_start
+```
+
 `.env` is only readable by you (`chmod 600`, re-checked on every run) and is
 never committed (`.gitignore`). Nothing ever prints or logs the password.
 
