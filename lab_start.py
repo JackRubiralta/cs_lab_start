@@ -4,10 +4,13 @@
   1. desktop    taskbar always shown with Firefox/VS Code/Terminal/Files pinned,
                 mouse at half speed
   2. checkin    the exercise-class check-in (/cs/studres/ct/lab-checkin):
-                selects the open session, presses y, then q
+                selects the open session, presses y, then q; if it can't, it
+                opens the check-in in this terminal for you
   3. exercises  copy every new CS1002 exercise week from /cs/studres into
                 ~/Documents/CS1002/Exercises (never overwrites a file)
-  4. browser    Firefox with StudRes CS1002, Outlook and MMS CS1002 open and
+  4. vscode     VS Code on the newest week, main .java file open, terminal
+                already in the folder stacscheck runs from
+  5. browser    Firefox with StudRes CS1002, Outlook and MMS CS1002 open and
                 signed in (email + password from .env; you approve the
                 Authenticator number on your phone)
 
@@ -24,6 +27,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -75,7 +79,14 @@ LOGIN_HOSTS = ("login.microsoftonline.com", "login.microsoft.com", "login.live.c
 
 
 def say(msg=""):
-    print(msg, flush=True)
+    """Print, never crash: odd file names (bad UTF-8) or a closed terminal can't stop the run."""
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(msg.encode(enc, "replace").decode(enc, "replace"), flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def head(title):
@@ -189,116 +200,309 @@ def desktop_file_exists(name):
 
 # ================================================================== checkin
 LAB_CHECKIN = os.environ.get("CS_LAB_CHECKIN", "/cs/studres/ct/lab-checkin")
-ANSI_RE = re.compile(r"\x1b(\[[0-9;?<>=]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|[()][0-9A-Za-z]|[=>78DEHMNOZc])")
+LOG_DIR = os.path.join(HERE, "logs")
+CHECKIN_ROWS, CHECKIN_COLS = 40, 120
+
+# Screen titles of the real check-in (a ratatui TUI; text from the binary), most specific first.
+#   state        text on screen                                  key
+CHECKIN_SCREENS = [
+    ("recorded",  r"CHECK-IN RECORDED",                           b"q"),
+    ("failed",    r"CHECK-IN FAILED",                             None),
+    ("none",      r"NO ELIGIBLE SESSION|No attendance session is currently open", None),
+    ("recording", r"RECORDING CHECK-IN|Submitting securely",      None),
+    ("confirm",   r"CONFIRM CHECK-IN|Check in as \S+",            b"y"),
+    ("list",      r"ELIGIBLE SESSIONS|SELECTED SESSION",          b"\r"),
+    ("auth",      r"AUTHENTICATING|Verifying your native Kerberos", None),
+]
+# Failures worth one more go (r = "a fresh Kerberos authentication and session search")
+RETRYABLE = r"temporarily unavailable|timed out|could not connect|grant has expired|no longer available"
 
 
 def screen_text(raw):
-    """Terminal output -> plain text (escape codes and box lines removed)."""
-    txt = ANSI_RE.sub(" ", raw.decode("utf-8", "replace"))
-    txt = re.sub(r"[─│┌┐└┘├┤┬┴┼━┃╭╮╰╯═║]+", " ", txt)
-    return re.sub(r"[ \t\r]+", " ", txt)
+    """Terminal bytes -> what the screen shows, as one line (for messages and tests)."""
+    from vtscreen import Screen
+    s = Screen(CHECKIN_ROWS, CHECKIN_COLS)
+    s.feed(raw if isinstance(raw, bytes) else raw.encode())
+    return s.flat()
 
 
-def lab_checkin(wait_minutes=0, timeout=60):
-    """Run the School's check-in TUI in a hidden terminal and press the keys:
-    Enter on the session list, y on "Check in as …?", q when done."""
-    head("Lab check-in")
-    if not os.access(LAB_CHECKIN, os.X_OK):
-        say("  %s not found (not on a lab PC?), skipped" % LAB_CHECKIN)
-        return False
-    import pty, fcntl, termios, struct, select   # POSIX only
+def checkin_state(flat):
+    for state, pattern, _ in CHECKIN_SCREENS:
+        if re.search(pattern, flat):
+            return state
+    return None
+
+
+def _open_log():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        old = sorted(f for f in os.listdir(LOG_DIR) if f.startswith("checkin-"))
+        for f in old[:-30]:          # keep the last 30 runs
+            os.unlink(os.path.join(LOG_DIR, f))
+        path = os.path.join(LOG_DIR, time.strftime("checkin-%Y%m%d-%H%M%S.out"))
+        return path, open(path, "wb")
+    except OSError:
+        return None, None
+
+
+def _spawn(rows, cols):
+    import pty, fcntl, termios, struct   # POSIX only
     pid, fd = pty.fork()
     if pid == 0:
-        os.environ["TERM"] = os.environ.get("TERM", "xterm-256color") or "xterm-256color"
+        os.environ["TERM"] = os.environ.get("TERM") or "xterm-256color"
         try:
             os.execv(LAB_CHECKIN, [LAB_CHECKIN])
         finally:
             os._exit(127)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    return pid, fd
 
-    seen = b""            # everything since the last key we sent
-    full = ""             # all plain text, for the summary
-    sent = []
-    outcome = None
-    deadline = time.time() + timeout
-    wait_until = time.time() + wait_minutes * 60
-    last_retry = 0.0
-    last_output = time.time()
+
+def _reap(pid, fd):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    for _ in range(20):
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                break
+        except OSError:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _drive(wait_minutes, timeout, log):
+    """Run lab-checkin in a hidden terminal and press the keys a person would.
+
+    The screen is rebuilt cell by cell (vtscreen), because the TUI only redraws
+    what changed and animates a spinner, so the raw output never holds whole
+    words. Returns (outcome, last screen text, keys sent)."""
+    import select
+    from vtscreen import Screen
+    pid, fd = _spawn(CHECKIN_ROWS, CHECKIN_COLS)
+    scr = Screen(CHECKIN_ROWS, CHECKIN_COLS)
+    sent, outcome = [], None
+    start = time.time()
+    deadline = start + timeout
+    wait_until = start + wait_minutes * 60
+    hard = max(wait_until, start) + timeout + 60     # never longer than this, whatever the screen
+    state, state_since, last_key_at, presses_here = None, start, 0.0, 0
+    retries, last_retry = 0, 0.0
+    exited = False
+    snap = ""
 
     def press(key, why):
-        nonlocal seen
-        os.write(fd, key)
+        nonlocal last_key_at, presses_here
+        try:
+            os.write(fd, key)
+        except OSError:
+            return
         sent.append(why)
-        seen = b""
+        last_key_at = time.time()
+        presses_here += 1
+        if log:
+            log.write(b"\n<<<sent %r at +%.1fs>>>\n" % (key, time.time() - start))
 
     try:
-        while time.time() < deadline:
-            r, _, _ = select.select([fd], [], [], 0.3)
+        while time.time() < min(deadline, hard):
+            r, _, _ = select.select([fd], [], [], 0.15)
             if r:
                 try:
                     chunk = os.read(fd, 65536)
                 except OSError:
-                    break             # program exited
+                    chunk = b""
                 if not chunk:
+                    exited = True
                     break
-                seen += chunk
-                full += screen_text(chunk)
-                last_output = time.time()
+                if log:
+                    log.write(chunk)
+                scr.feed(chunk)
+                reply = scr.take_replies()      # e.g. cursor-position queries
+                if reply:
+                    try:
+                        os.write(fd, reply)
+                    except OSError:
+                        pass
+            now = time.time()
+            flat = scr.flat()
+            st = checkin_state(flat)
+            if st or flat.strip():
+                snap = scr.text()            # the TUI wipes its screen on exit; keep the last one
+            if st != state:
+                state, state_since, presses_here = st, now, 0
+            if now - state_since < 0.5:
+                continue                         # let the new screen finish drawing
+            if st is None and now - state_since > 20:
+                break                            # a screen we don't know: hand over
+            # a key on this screen already went in: give it 4 s, then press again (max 3)
+            if presses_here and now - last_key_at < 4:
                 continue
-            if time.time() - last_output < 0.4:
-                continue              # let the screen finish drawing
-            now = screen_text(seen)
-            if re.search(r"CHECK-IN\s+RECORDED", now):
+            if presses_here >= 3 and st not in ("none",):
+                break                            # keys aren't landing: hand over
+
+            if st == "recorded":
                 outcome = "recorded"
-                press(b"q", "q (close)")
-            elif "NO ELIGIBLE SESSION" in now or "No attendance session" in now:
-                if time.time() < wait_until:
-                    if time.time() - last_retry > 30:
+                press(b"q" if presses_here == 0 else b"\r", "q (close)")
+            elif st == "failed":
+                if retries and now - last_retry < 6:
+                    continue                     # the retry may still be on its way
+                if re.search(RETRYABLE, flat) and retries < 2:
+                    retries += 1
+                    last_retry = now
+                    deadline = max(deadline, now + 45)
+                    press(b"r", "r (retry)")
+                    presses_here = 0
+                else:
+                    outcome = "failed"
+                    press(b"q", "q (quit)")
+            elif st == "none":
+                if now < wait_until:
+                    if now - last_retry > 30:
                         if not last_retry:
                             say("  no session open yet; trying again every 30 s (Ctrl-C to stop)")
-                        last_retry = time.time()
-                        deadline = time.time() + timeout
+                        last_retry = now
+                        deadline = max(deadline, now + 60)
                         press(b"r", "r (try again)")
+                        presses_here = 0
                     continue
                 outcome = "none open"
                 press(b"q", "q (quit)")
-            elif "CHECK-IN FAILED" in now:
-                outcome = "failed"
-                press(b"q", "q (quit)")
-            elif "Check in as" in now or "CONFIRM CHECK-IN" in now:
+            elif st == "confirm":
                 press(b"y", "y (check in)")
-            elif "ELIGIBLE SESSIONS" in now or "SELECTED SESSION" in now:
+            elif st == "list":
                 press(b"\r", "Enter (select session)")
-            elif outcome and time.time() - last_output > 2:
+            elif st in ("auth", "recording"):
+                deadline = max(deadline, now + 20)   # server is working; don't give up mid-way
+            if outcome and presses_here >= 2:
                 break
     finally:
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-        try:
-            os.waitpid(pid, 0)
-        except OSError:
-            pass
-        os.close(fd)
+        # Let a final screen finish (e.g. after q), then stop it.
+        _reap(pid, fd)
+    text = scr.text() if scr.flat().strip() else snap
+    if outcome is None and exited:
+        outcome = "exited"
+    return outcome, text, sent
 
-    if outcome == "recorded":
-        m = re.search(r"\b([A-Z]{2}\d{4})\b.*?(on time|\d+m \d+s after start|early|late)", full)
-        say("  CHECKED IN" + (" – %s, %s" % (m.group(1), m.group(2)) if m else ""))
-        return True
-    if outcome == "none open":
-        say("  no attendance session open right now (it opens 10 minutes before the class)")
-        say("  run ./start checkin again closer to the start, or ./start checkin --wait 15")
+
+def _interactive(log):
+    """Hand the real check-in to the person at the keyboard, watching the screen.
+
+    Their keys go straight to it; we only look for CHECK-IN RECORDED."""
+    import select, termios, tty, fcntl, struct
+    from vtscreen import Screen
+    try:
+        rows, cols = struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))[:2]
+    except OSError:
+        rows, cols = CHECKIN_ROWS, CHECKIN_COLS
+    rows, cols = rows or CHECKIN_ROWS, cols or CHECKIN_COLS
+    pid, fd = _spawn(rows, cols)
+    scr = Screen(rows, cols)
+    stdin = sys.stdin.fileno()
+    old = termios.tcgetattr(stdin)
+    recorded = False
+    try:
+        tty.setraw(stdin)
+        while True:
+            r, _, _ = select.select([fd, stdin], [], [], 0.5)
+            if fd in r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    break
+                os.write(sys.stdout.fileno(), chunk)
+                if log:
+                    log.write(chunk)
+                scr.feed(chunk)
+                scr.take_replies()           # the real terminal answers for itself
+                if re.search(r"CHECK-IN RECORDED", scr.flat()):
+                    recorded = True
+            if stdin in r:
+                data = os.read(stdin, 1024)
+                if not data:
+                    break
+                os.write(fd, data)
+    finally:
+        termios.tcsetattr(stdin, termios.TCSADRAIN, old)
+        _reap(pid, fd)
+        os.write(sys.stdout.fileno(), b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\r\n")
+    return recorded, scr.text()
+
+
+def _screen_lines(text, n=8):
+    lines = [re.sub(r"[─-╿]+", " ", l).strip() for l in text.split("\n")]
+    lines = [re.sub(r"\s{2,}", "  ", l) for l in lines if l.strip(" │")]
+    return lines[-n:]
+
+
+def lab_checkin(wait_minutes=0, timeout=90, manual=False):
+    """The exercise-class check-in: Enter on the session, y on "Check in as …?",
+    q when it says CHECK-IN RECORDED. If it can't get there by itself it opens
+    the check-in right here for you to press the keys, so it never just hangs."""
+    head("Lab check-in")
+    if not os.access(LAB_CHECKIN, os.X_OK):
+        say("  %s not found (not on a lab PC?), skipped" % LAB_CHECKIN)
         return False
-    if outcome == "failed":
-        msg = re.search(r"CHECK-IN FAILED\s*(.{0,160}?)\s*(Retrying|r retry|q quit|$)", full)
-        say("  check-in FAILED: %s" % (msg.group(1).strip() if msg else "see lab-checkin"))
-        return False
-    say("  check-in didn't finish (keys sent: %s); run %s by hand" % (", ".join(sent) or "none", LAB_CHECKIN))
-    tail = [l.strip() for l in full.replace("\r", "\n").split("\n") if l.strip()][-6:]
-    for line in tail:
-        say("    | " + line[:150])
-    return False
+    log_path, log = _open_log()
+    try:
+        if manual:
+            outcome, text, sent = None, "", []
+        else:
+            outcome, text, sent = _drive(wait_minutes, timeout, log)
+        flat = re.sub(r"[─-╿]+", " ", text)
+        flat = re.sub(r"\s+", " ", flat)
+
+        if outcome == "recorded":
+            m = re.search(r"\b([A-Z]{2}\d{4})\b.*?(on time|\d+m \d+s after start|\d+s after start|early|late)", flat)
+            say("  CHECKED IN" + (" – %s, %s" % (m.group(1), m.group(2)) if m else ""))
+            return True
+        if outcome == "none open":
+            say("  no attendance session open right now (it opens 10 minutes before the class)")
+            say("  run ./start checkin again closer to the start, or ./start checkin --wait 15")
+            return False
+        if outcome == "failed":
+            m = re.search(r"CHECK-IN FAILED\s*(.{0,200}?)\s*(Retrying|r retry|q quit|$)", flat)
+            say("  check-in FAILED: %s" % (m.group(1).strip() if m else "see below"))
+            for line in _screen_lines(text):
+                say("    | " + line[:150])
+            return False
+        if outcome == "exited" and text.strip():
+            say("  lab-checkin stopped by itself:")
+            for line in _screen_lines(text):
+                say("    | " + line[:150])
+            if "workstation metadata" in flat or "logind" in flat:
+                say("  (it needs the lab PC's own desktop login – not ssh or su)")
+            return False
+
+        # Stuck on a screen we can't read, or keys not landing: give it to Jack.
+        if not manual:
+            say("  couldn't finish it by itself (keys sent: %s). Last screen:" % (", ".join(sent) or "none"))
+            for line in _screen_lines(text):
+                say("    | " + line[:150])
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            say("  run %s by hand: Enter, then y, then q" % LAB_CHECKIN)
+            return False
+        say("  opening the check-in here – press Enter, then y, then q")
+        time.sleep(1.5)
+        recorded, text = _interactive(log)
+        say("  CHECKED IN" if recorded else "  check-in closed without CHECK-IN RECORDED")
+        return recorded
+    finally:
+        if log:
+            log.close()
+            say("  (screen log: %s)" % os.path.relpath(log_path, HERE))
 
 
 # ================================================================ exercises
@@ -353,8 +557,9 @@ def plan_week(week_src):
         idx = len(parts) - 1 - parts[::-1].index("Tests")
         beside.setdefault(os.sep.join(parts[:idx]), s)
 
-    plan = []
-    for root, dirs, files in os.walk(week_src):
+    plan, problems = [], []
+    for root, dirs, files in os.walk(week_src, onerror=lambda e: problems.append(
+            "%s (%s)" % (os.path.relpath(getattr(e, "filename", "") or week_src, week_src), _why(e)))):
         dirs[:] = sorted(d for d in dirs if d != "Tests" and d not in SKIP_NAMES)
         rel_root = os.path.relpath(root, week_src)
         rel_root_parts = [] if rel_root == "." else rel_root.split(os.sep)
@@ -376,37 +581,96 @@ def plan_week(week_src):
                             dest = place(rel_root_parts + mparts, srcdirs,
                                          beside.get(root), mext in DOC_EXT)
                             plan.append((os.path.join(*dest), "zip", (path, member)))
-                except zipfile.BadZipFile:
-                    pass
+                except (zipfile.BadZipFile, OSError, RuntimeError, ValueError) as e:
+                    problems.append("%s (%s)" % (os.path.join(*(rel_root_parts + [name])), _why(e)))
                 continue
             dest = place(rel_root_parts + [name], srcdirs, beside.get(root), ext in DOC_EXT)
             plan.append((os.path.join(*dest), "file", path))
     # A loose StudRes file beats the same file inside a zip (W02's zip has an empty copy).
     plan.sort(key=lambda p: p[1] != "file")
-    return plan, tests
+    return plan, tests, problems
+
+
+def _why(e):
+    return getattr(e, "strerror", None) or str(e) or type(e).__name__
+
+
+def _copy_one(kind, source, dest):
+    """Copy one file to dest, which must not exist yet (never overwrites).
+    If the copy breaks half way, only the file this call created is removed."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if kind == "file":
+        src = open(source, "rb")
+    else:
+        zpath, member = source
+        z = zipfile.ZipFile(zpath)
+        try:
+            src = z.open(member)
+        except BaseException:
+            z.close()
+            raise
+    try:
+        out = open(dest, "xb")          # FileExistsError if it's there: nothing is touched
+    except BaseException:
+        src.close()
+        raise
+    try:
+        with src, out:
+            shutil.copyfileobj(src, out)
+    except BaseException:
+        try:
+            os.unlink(dest)             # ours, half written
+        except OSError:
+            pass
+        raise
+    finally:
+        if kind != "file":
+            z.close()
+    if kind == "file":
+        try:
+            shutil.copystat(source, dest)   # keep the date; fine if the file system won't
+        except OSError:
+            pass
+    try:
+        os.chmod(dest, os.stat(dest).st_mode | stat.S_IWUSR | stat.S_IRUSR)
+    except OSError:
+        pass
 
 
 def sync_exercises(dry_run=False):
+    """Copy new StudRes exercise files into ~/Documents. Never overwrites, never
+    crashes: a file, zip or week that can't be read is listed and skipped."""
     head("CS1002 exercises")
-    if not os.path.isdir(STUDRES_EXERCISES):
-        say("  %s not found (not on a lab PC?), skipped" % STUDRES_EXERCISES)
+    try:
+        weeks = sorted((w for w in os.listdir(STUDRES_EXERCISES) if WEEK_RE.match(w)),
+                       key=lambda w: int(w[1:]))
+    except OSError as e:
+        say("  can't read %s (%s) – not on a lab PC?, skipped" % (STUDRES_EXERCISES, _why(e)))
         return False
-    weeks = sorted((w for w in os.listdir(STUDRES_EXERCISES) if WEEK_RE.match(w)),
-                   key=lambda w: int(w[1:]))
-    copied, kept = [], 0
+    copied, kept, failed = [], 0, []
     newest_tests = None
     for week in weeks:
         week_src = os.path.join(STUDRES_EXERCISES, week)
         week_dst = os.path.join(MY_EXERCISES, week)
-        plan, tests = plan_week(week_src)
+        try:
+            plan, tests, problems = plan_week(week_src)
+        except Exception as e:           # a whole week unreadable: skip just that week
+            failed.append("%s/ (%s)" % (week, _why(e)))
+            continue
+        failed.extend(os.path.join(week, p) for p in problems)
         if tests:
             newest_tests = (week, tests)
             for _, srcdir in tests:   # the folder stacscheck looks for, even with no starter code
                 d = os.path.join(week_dst, srcdir)
                 if not os.path.isdir(d):
-                    copied.append(os.path.join(week, srcdir) + "/")
-                    if not dry_run:
+                    if dry_run:
+                        copied.append(os.path.join(week, srcdir) + "/")
+                        continue
+                    try:
                         os.makedirs(d, exist_ok=True)
+                        copied.append(os.path.join(week, srcdir) + "/")
+                    except OSError as e:
+                        failed.append("%s/ (%s)" % (os.path.join(week, srcdir), _why(e)))
         seen = set()
         for rel, kind, source in plan:
             if rel in seen:
@@ -416,28 +680,38 @@ def sync_exercises(dry_run=False):
             if os.path.lexists(dest):
                 kept += 1
                 continue
-            copied.append(os.path.join(week, rel))
             if dry_run:
+                copied.append(os.path.join(week, rel))
                 continue
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if kind == "file":
-                shutil.copy2(source, dest)
-            else:
-                zpath, member = source
-                with zipfile.ZipFile(zpath) as z, z.open(member) as src, open(dest, "xb") as out:
-                    shutil.copyfileobj(src, out)
-            os.chmod(dest, os.stat(dest).st_mode | stat.S_IWUSR)
+            try:
+                _copy_one(kind, source, dest)
+                copied.append(os.path.join(week, rel))
+            except KeyboardInterrupt:
+                raise
+            except FileExistsError:
+                kept += 1
+            except Exception as e:
+                failed.append("%s (%s)" % (os.path.join(week, rel), _why(e)))
 
     # Shared stylesheet some sheets link to (../css/standard.css)
     css_src = os.path.join(STUDRES_EXERCISES, "css")
-    if os.path.isdir(css_src):
-        for name in sorted(os.listdir(css_src)):
-            dest = os.path.join(MY_EXERCISES, "css", name)
-            if not os.path.lexists(dest):
-                copied.append(os.path.join("css", name))
-                if not dry_run:
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    shutil.copy2(os.path.join(css_src, name), dest)
+    try:
+        css_names = sorted(os.listdir(css_src)) if os.path.isdir(css_src) else []
+    except OSError as e:
+        css_names = []
+        failed.append("css/ (%s)" % _why(e))
+    for name in css_names:
+        dest = os.path.join(MY_EXERCISES, "css", name)
+        if os.path.lexists(dest) or not os.path.isfile(os.path.join(css_src, name)):
+            continue
+        if dry_run:
+            copied.append(os.path.join("css", name))
+            continue
+        try:
+            _copy_one("file", os.path.join(css_src, name), dest)
+            copied.append(os.path.join("css", name))
+        except Exception as e:
+            failed.append("css/%s (%s)" % (name, _why(e)))
 
     verb = "would copy" if dry_run else "copied"
     if copied:
@@ -449,13 +723,88 @@ def sync_exercises(dry_run=False):
     else:
         say("  up to date (%s)" % MY_EXERCISES)
     say("  %d existing file(s) left untouched" % kept)
+    if failed:
+        say("  skipped %d thing(s) StudRes wouldn't let me read (everything else is copied):" % len(failed))
+        for f in failed[:10]:
+            say("    ! " + f)
+        if len(failed) > 10:
+            say("    … and %d more" % (len(failed) - 10))
     if newest_tests:
         week, tests = newest_tests
+        LATEST["week"], LATEST["srcdirs"] = week, [s for _, s in tests]
         say("  test %s with:" % week)
         say("    cd %s" % os.path.join(MY_EXERCISES, week))
         for tdir, _ in tests:
             if os.path.basename(tdir) == "Tests" or len(tests) == 1:
                 say("    stacscheck %s" % tdir)
+    # Copying most of it is a success; skipped files are reported above.
+    return bool(weeks) and (bool(copied) or kept > 0 or not failed)
+
+
+# ================================================================== vscode
+LATEST = {}   # newest exercise week, filled in by sync_exercises
+
+
+def latest_week_dir():
+    """~/Documents/CS1002/Exercises/WNN for the newest week (from this run, else on disk)."""
+    if LATEST.get("week"):
+        d = os.path.join(MY_EXERCISES, LATEST["week"])
+        if os.path.isdir(d):
+            return d, LATEST.get("srcdirs", [])
+    try:
+        weeks = sorted((w for w in os.listdir(MY_EXERCISES)
+                        if WEEK_RE.match(w) and os.path.isdir(os.path.join(MY_EXERCISES, w))),
+                       key=lambda w: int(w[1:]))
+    except OSError:
+        return None, []
+    return (os.path.join(MY_EXERCISES, weeks[-1]), []) if weeks else (None, [])
+
+
+def find_code():
+    for name in ("code", "codium", "code-oss"):
+        path = shutil.which(name)
+        if path:
+            return [path]
+    for path in ("/usr/bin/code", "/usr/share/code/bin/code", "/opt/visual-studio-code/bin/code",
+                 "/var/lib/flatpak/exports/bin/com.visualstudio.code"):
+        if os.access(path, os.X_OK):
+            return [path]
+    if shutil.which("flatpak") and run(["flatpak", "info", "com.visualstudio.code"]).returncode == 0:
+        return ["flatpak", "run", "com.visualstudio.code"]
+    return None
+
+
+def open_vscode():
+    """Open VS Code on the newest week, with its main .java file in front.
+    The week folder is the workspace, so VS Code's terminal starts where stacscheck wants."""
+    head("VS Code")
+    week_dir, srcdirs = latest_week_dir()
+    if not week_dir:
+        say("  no exercise week in %s yet, skipped" % MY_EXERCISES)
+        return False
+    code = find_code()
+    if not code:
+        say("  VS Code not found on this PC, skipped")
+        return False
+    files = []
+    for sd in srcdirs or sorted(os.listdir(week_dir)):
+        d = os.path.join(week_dir, sd)
+        if not os.path.isdir(d):
+            continue
+        try:
+            javas = sorted(f for f in os.listdir(d) if f.endswith(".java"))
+        except OSError:
+            continue
+        main = [f for f in javas if f == sd + ".java"] or javas[:1]
+        files += [os.path.join(d, f) for f in main]
+    cmd = code + ["--new-window", week_dir] + files[:2]
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, cwd=week_dir)
+    except OSError as e:
+        say("  couldn't start VS Code: %s" % _why(e))
+        return False
+    say("  opened %s%s" % (week_dir, (" (" + ", ".join(os.path.basename(f) for f in files[:2]) + ")") if files else ""))
     return True
 
 
@@ -496,7 +845,12 @@ def firefox_running():
 
 
 def launch_firefox():
-    log = open(os.path.join(os.path.expanduser("~"), ".cs_lab_start-firefox.log"), "ab")
+    # In logs/ (inside ~/Documents) so it survives logout: if a tab crashes, the reason is in here.
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log = open(os.path.join(LOG_DIR, time.strftime("firefox-%Y%m%d-%H%M%S.log")), "ab")
+    except OSError:
+        log = subprocess.DEVNULL
     subprocess.Popen(["firefox", "--marionette", "--remote-allow-system-access"]
                      if firefox_supports_system_access() else ["firefox", "--marionette"],
                      stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
@@ -542,6 +896,8 @@ if (!num && /Authenticator|Approve sign.?in/i.test(text))
   num = [...document.querySelectorAll('div,span,p')].find(e => vis(e) && /^\s*\d{2,3}\s*$/.test(e.innerText || ''));
 if (num) { out.kind = 'number'; out.number = num.innerText.trim(); return out; }
 if (/Approve sign.?in request|Check your Authenticator|open your Authenticator/i.test(text)) { out.kind = 'approve'; return out; }
+if (/We didn.t hear from you|request (was )?denied|denied the request|You.ve hit our limit/i.test(text)) {
+  out.kind = 'error'; out.error = 'Authenticator: ' + (text.match(/We didn.t hear from you|request (was )?denied|denied the request|You.ve hit our limit[^.]*/i) || [''])[0]; return out; }
 if (/Stay signed in\?/i.test(text)) { out.kind = 'kmsi'; return out; }
 if (/Pick an account/i.test(text)) { out.kind = 'picker'; return out; }
 if (/Verify your identity/i.test(text)) { out.kind = 'method'; return out; }
@@ -575,13 +931,24 @@ def submit(m):
 def sign_in(m, url, email, password, state):
     """Drive whatever login page the current tab shows until the site in url is open."""
     target_hosts, signed_in_re = SIGNED_IN[url]
+    target = url
     deadline = time.time() + LOGIN_TIMEOUT
     last = (None, 0.0)
+    silent_since = None
     while time.time() < deadline:
         try:
             page = m.js(DETECT_JS)
+            silent_since = None
         except MarionetteError:
-            time.sleep(0.5)   # page mid-navigation
+            # page mid-navigation, or Firefox slow to answer; a tab that stays silent has died
+            silent_since = silent_since or time.time()
+            if time.time() - silent_since > 20:
+                reload_crashed(m, target, state, "isn't answering")
+                silent_since = None
+            time.sleep(0.5)
+            continue
+        if tab_crashed(page):
+            reload_crashed(m, target, state, "crashed")
             continue
         url = page.get("url", "")
         host = re.sub(r"^\w+://([^/]+).*$", r"\1", url)
@@ -598,52 +965,99 @@ def sign_in(m, url, email, password, state):
             continue
         last = (key, time.time())
 
-        if kind == "error":
-            raise LoginFailed(page.get("error", "sign-in error"))
-        if kind == "email":
-            if not email:
-                raise LoginFailed("no EMAIL in %s" % ENV_FILE)
-            box = m.find('input[name="loginfmt"]')
-            if not page.get("filled"):
-                m.clear(box)
-                m.send_keys(box, email)
-            submit(m)
-            say("  email entered")
-        elif kind == "password":
-            if not password:
-                raise LoginFailed("no PASSWORD in %s – fill it in and run ./start browser" % ENV_FILE)
-            if state.get("password_tries", 0) >= 1:
-                raise LoginFailed("the password page came back – check PASSWORD in .env "
-                                  "(stopped so your account doesn't get locked)")
-            state["password_tries"] = state.get("password_tries", 0) + 1
-            box = m.find('input[name="passwd"]') or m.find('input[type="password"]')
-            m.clear(box)
-            m.send_keys(box, password)
-            submit(m)
-            say("  password entered")
-        elif kind == "number":
-            if state.get("shown") != page["number"]:   # once per code, not every poll
-                state["shown"] = page["number"]
-                show_number(page["number"])
-        elif kind == "approve":
-            if state.get("shown") != "approve":
-                state["shown"] = "approve"
-                say("  approve the sign-in on your phone (Microsoft Authenticator)…")
-                notify("Approve the sign-in in Microsoft Authenticator")
-        elif kind == "kmsi":
-            submit(m)   # "Stay signed in?" -> Yes (this PC forgets it on restart anyway)
-            say("  'Stay signed in?' -> Yes")
-        elif kind == "picker":
-            if email and m.js(CLICK_TEXT_JS, email):
-                say("  picked account " + email)
-        elif kind == "method":
-            for label in ("Approve a request on my Microsoft Authenticator",
-                          "Microsoft Authenticator", "Authenticator app"):
-                if m.js(CLICK_TEXT_JS, label):
-                    say("  chose Microsoft Authenticator")
-                    break
+        try:
+            act(m, page, kind, email, password, state)
+        except MarionetteError:
+            pass   # the page changed under us; look again
         time.sleep(0.7)
     raise LoginFailed("timed out after %d s waiting for %s" % (LOGIN_TIMEOUT, target_hosts[0]))
+
+
+def act(m, page, kind, email, password, state):
+    """Do the one thing the current login page needs."""
+    if kind == "error":
+        raise LoginFailed(page.get("error", "sign-in error"))
+    if kind == "email":
+        if not email:
+            raise LoginFailed("no EMAIL in %s" % ENV_FILE)
+        box = m.find('input[name="loginfmt"]')
+        if not page.get("filled"):
+            m.clear(box)
+            m.send_keys(box, email)
+        submit(m)
+        say("  email entered")
+    elif kind == "password":
+        if not password:
+            raise LoginFailed("no PASSWORD in %s – fill it in and run ./start browser" % ENV_FILE)
+        if state.get("password_tries", 0) >= 1:
+            raise LoginFailed("the password page came back – check PASSWORD in .env "
+                              "(stopped so your account doesn't get locked)")
+        state["password_tries"] = state.get("password_tries", 0) + 1
+        box = m.find('input[name="passwd"]') or m.find('input[type="password"]')
+        m.clear(box)
+        m.send_keys(box, password)
+        submit(m)
+        say("  password entered")
+    elif kind == "number":
+        if state.get("shown") != page["number"]:   # once per code, not every poll
+            state["shown"] = page["number"]
+            show_number(page["number"])
+    elif kind == "approve":
+        if state.get("shown") != "approve":
+            state["shown"] = "approve"
+            say("  approve the sign-in on your phone (Microsoft Authenticator)…")
+            notify("Approve the sign-in in Microsoft Authenticator")
+    elif kind == "kmsi":
+        submit(m)   # "Stay signed in?" -> Yes (this PC forgets it on restart anyway)
+        say("  'Stay signed in?' -> Yes")
+    elif kind == "picker":
+        if email and m.js(CLICK_TEXT_JS, email):
+            say("  picked account " + email)
+    elif kind == "method":
+        for label in ("Approve a request on my Microsoft Authenticator",
+                      "Microsoft Authenticator", "Authenticator app"):
+            if m.js(CLICK_TEXT_JS, label):
+                say("  chose Microsoft Authenticator")
+                break
+
+
+def tab_crashed(page):
+    """Firefox's "Gah. Your tab just crashed." page (about:tabcrashed)."""
+    return (page.get("url", "").startswith("about:tabcrashed")
+            or re.search(r"tab just crashed|Your tab crashed|Tab crashed", page.get("page", ""), re.I))
+
+
+def reload_crashed(m, url, state, why):
+    """Load the site again in a tab that crashed; give up after 3 tries per run."""
+    state["crashes"] = state.get("crashes", 0) + 1
+    if state["crashes"] > 3:
+        raise LoginFailed("the tab keeps crashing – Firefox's reason is in logs/firefox-*.log")
+    say("  the tab %s – loading it again (%d/3)" % (why, state["crashes"]))
+    try:
+        m.navigate(url)
+    except MarionetteError:
+        try:                                  # the tab itself is gone: use a fresh one
+            m.switch_to(m.new_tab())
+            m.navigate(url)
+        except MarionetteError:
+            pass
+    time.sleep(1)
+
+
+def heal_tabs(m, handles, urls, state):
+    """Last look at each of our tabs: any that crashed gets its site loaded again."""
+    for h, url in zip(handles, urls):
+        try:
+            m.switch_to(h)
+            page = m.js("return {url: location.href, page: document.title + ' | ' + "
+                        "((document.body && document.body.innerText) || '').slice(0, 300)};")
+        except MarionetteError:
+            continue
+        if tab_crashed(page):
+            try:
+                reload_crashed(m, url, state, "crashed")
+            except LoginFailed as e:
+                say("  " + str(e))
 
 
 def show_number(number):
@@ -657,7 +1071,8 @@ def show_number(number):
 
 def notify(text):
     if shutil.which("notify-send"):
-        run(["notify-send", "-u", "critical", "CS lab start", text])
+        # normal urgency: GNOME never hides "critical" ones, so a used code would stay on screen
+        run(["notify-send", "-u", "normal", "-t", "120000", "CS lab start", text])
 
 
 def quiet_first_run(m):
@@ -669,7 +1084,11 @@ def quiet_first_run(m):
           p.setBoolPref('browser.aboutwelcome.enabled', false);
           p.setBoolPref('datareporting.policy.dataSubmissionPolicyBypassNotification', true);
           p.setBoolPref('browser.shell.checkDefaultBrowser', false);
-          p.setBoolPref('browser.startup.homepage_override.mstone', false) ;
+          p.setCharPref('browser.startup.homepage_override.mstone', 'ignore');
+          // Lab home folders are small: keep the web cache in memory, not on disk,
+          // so a full quota can't make tabs crash.
+          p.setBoolPref('browser.cache.disk.enable', false);
+          p.setBoolPref('browser.cache.memory.enable', true);
         """)
     except MarionetteError:
         pass
@@ -725,6 +1144,7 @@ def setup_browser(login=True):
                     say("  %s: NOT signed in – %s" % (name, e))
                     ok = False
                     login = False   # don't hammer the login page from the other tabs
+        heal_tabs(m, mine, [u for _, u in urls], state)
         # Close anything else (welcome page, privacy notice, old tabs).
         time.sleep(2)
         for h in m.handles():
@@ -732,41 +1152,106 @@ def setup_browser(login=True):
                 m.switch_to(h)
                 m.close_tab()
         m.switch_to(mine[0])
+    except (MarionetteError, OSError) as e:
+        say("  lost control of Firefox (closed?): %s" % e)
+        ok = False
     finally:
         m.delete_session()   # ends remote control; Firefox stays open
         m.close()
     return ok
 
 
+# ============================================================ close terminal
+TERMINAL_APPS = ("gnome-terminal-", "gnome-terminal", "ptyxis", "ptyxis-agent", "kgx", "konsole",
+                 "xterm", "xfce4-terminal", "tilix", "terminator", "mate-terminal", "alacritty",
+                 "kitty", "foot", "ghostty", "wezterm-gui")
+SHELLS = ("bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh")
+
+
+def proc_name(pid):
+    try:
+        with open("/proc/%d/comm" % pid) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def proc_parent(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def close_my_terminal():
+    """Close the terminal tab this was started from, so only Firefox is left.
+
+    Only when it's plainly an interactive shell inside a terminal app; ./start
+    run from a script, over ssh or inside another program is left alone."""
+    shell = os.getppid()
+    if proc_name(shell) not in SHELLS or not sys.stdin.isatty():
+        return False
+    term = proc_name(proc_parent(shell))
+    if not term.startswith(TERMINAL_APPS):
+        return False
+    say("\n  all done – closing this terminal")
+    sys.stdout.flush()
+    time.sleep(2)
+    os.kill(shell, signal.SIGHUP)   # the shell exits, so the terminal tab/window closes
+    return True
+
+
 # ===================================================================== main
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("parts", nargs="*", metavar="part",
-                    help="desktop, checkin, exercises, browser (default: all of them)")
+                    help="desktop, checkin, exercises, vscode, browser (default: all of them)")
     ap.add_argument("--no-login", action="store_true", help="open the tabs without signing in")
     ap.add_argument("--dry-run", action="store_true", help="exercises: only show what would be copied")
+    ap.add_argument("--keep-terminal", action="store_true",
+                    help="don't close this terminal at the end")
+    ap.add_argument("--manual", action="store_true",
+                    help="checkin: open the check-in for you to press the keys yourself")
     ap.add_argument("--wait", type=float, default=0, metavar="MIN",
                     help="checkin: keep retrying for MIN minutes if no session is open yet")
     args = ap.parse_args()
-    known = ["desktop", "checkin", "exercises", "browser"]
+    known = ["desktop", "checkin", "exercises", "vscode", "browser"]
     bad = [p for p in args.parts if p not in known]
     if bad:
         ap.error("unknown part %s (choose from %s)" % (", ".join(bad), ", ".join(known)))
     parts = args.parts or known
 
+    steps = {
+        "desktop": setup_desktop,
+        "checkin": lambda: lab_checkin(args.wait, manual=args.manual),
+        "exercises": lambda: sync_exercises(args.dry_run),
+        "vscode": open_vscode,
+        "browser": lambda: setup_browser(login=not args.no_login),
+    }
     results = {}
-    if "desktop" in parts:
-        results["desktop"] = setup_desktop()
-    if "checkin" in parts:
-        results["checkin"] = lab_checkin(args.wait)
-    if "exercises" in parts:
-        results["exercises"] = sync_exercises(args.dry_run)
-    if "browser" in parts:
-        results["browser"] = setup_browser(login=not args.no_login)
+    try:
+        for name in known:
+            if name in parts:
+                try:
+                    results[name] = steps[name]()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:   # one broken part never stops the rest
+                    say("  %s crashed: %s: %s" % (name, type(e).__name__, e))
+                    results[name] = False
+    except KeyboardInterrupt:
+        say("\n  stopped (Ctrl-C)")
+        return 130
     head("Done")
     for k, v in results.items():
         say("  %-10s %s" % (k, "ok" if v else "needs a look (see above)"))
-    return 0 if all(results.values()) else 1
+    all_ok = all(results.values())
+    # Full run that worked: leave only Firefox on screen. Anything wrong: keep
+    # the terminal so the messages above can be read.
+    if all_ok and not args.parts and not args.keep_terminal:
+        close_my_terminal()
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":

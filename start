@@ -1,3 +1,8 @@
 #!/bin/bash
-# Set up this CS lab PC: taskbar, mouse, check-in, exercises, Firefox. See README.md.
-exec python3 "$(dirname "$(readlink -f "$0")")/lab_start.py" "$@"
+# Set up this CS lab PC: taskbar, mouse, check-in, exercises, VS Code, Firefox. See README.md.
+dir="$(dirname "$(readlink -f "$0")")"
+# Get the newest version first (never blocks for long; offline = run what we have).
+if [ -d "$dir/.git" ] && command -v git >/dev/null; then
+    timeout 10 git -C "$dir" pull --ff-only --quiet >/dev/null 2>&1 || true
+fi
+exec python3 "$dir/lab_start.py" "$@"

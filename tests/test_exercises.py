@@ -74,6 +74,24 @@ class ExerciseSync(unittest.TestCase):
         self.assertEqual(self.read("W07/W07Exercises.html"), "<html>")   # missing file restored
         self.assertEqual(self.read("W08/W08Exercises/W08Exercises.java"), "new week")
 
+    def test_unreadable_file_is_reported_not_fatal(self):
+        bad = f"{self.src}/W07/secret.txt"
+        write(bad, "x")
+        os.chmod(bad, 0)
+        if os.access(bad, os.R_OK):
+            self.skipTest("running as root")
+        self.assertTrue(lab_start.sync_exercises())
+        self.assertEqual(self.read("W07/W07Exercises/W07Exercises.java"), "class W07Exercises {}")
+
+    def test_name_clash_in_my_folder(self):
+        write(os.path.join(self.dst, "W07"), "a file where the week folder should be")
+        self.assertTrue(lab_start.sync_exercises())   # W07 skipped with a message, others copied
+        self.assertEqual(self.read("W01/W01Exercises/W01Exercise1.java"), "starter")
+
+    def test_missing_studres(self):
+        lab_start.STUDRES_EXERCISES = "/nonexistent"
+        self.assertFalse(lab_start.sync_exercises())
+
     def test_dry_run_writes_nothing(self):
         lab_start.sync_exercises(dry_run=True)
         self.assertFalse(os.path.exists(self.dst))

@@ -20,8 +20,9 @@ class MarionetteError(Exception):
 
 
 class Marionette:
-    def __init__(self, port=2828, host="127.0.0.1"):
+    def __init__(self, port=2828, host="127.0.0.1", call_timeout=20):
         self.host, self.port = host, port
+        self.call_timeout = call_timeout   # no single command may block longer than this
         self.sock = None
         self.msg_id = 0
         self.buf = b""
@@ -34,7 +35,7 @@ class Marionette:
         while time.time() < deadline:
             try:
                 self.sock = socket.create_connection((self.host, self.port), timeout=5)
-                self.sock.settimeout(120)
+                self.sock.settimeout(self.call_timeout)
                 self._read()  # greeting: {"applicationType": "gecko", ...}
                 return self
             except (OSError, ValueError) as e:
@@ -68,12 +69,18 @@ class Marionette:
         self.buf = rest[length:]
         return json.loads(rest[:length].decode("utf-8"))
 
-    def send(self, name, params=None):
+    def send(self, name, params=None, timeout=None):
         self.msg_id += 1
+        self.sock.settimeout(timeout or self.call_timeout)
         data = json.dumps([0, self.msg_id, name, params or {}]).encode("utf-8")
         self.sock.sendall(str(len(data)).encode() + b":" + data)
         while True:
-            msg = self._read()
+            try:
+                msg = self._read()
+            except socket.timeout:
+                # Firefox didn't answer in time. A late reply carries an old id
+                # and is skipped by the check below on the next command.
+                raise MarionetteError("timeout", "%s took over %d s" % (name, timeout or self.call_timeout))
             if msg[0] == 1 and msg[1] == self.msg_id:
                 break
         error, result = msg[2], msg[3]
@@ -85,10 +92,11 @@ class Marionette:
 
     # ---- session and windows --------------------------------------------
     def new_session(self):
+        # A first start on a fresh profile can take well over 20 s.
         return self.send("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {
             "pageLoadStrategy": "none",   # never block on slow pages; we poll instead
             "unhandledPromptBehavior": "ignore",
-        }}})
+        }}}, timeout=120)
 
     def delete_session(self):
         try:
