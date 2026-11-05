@@ -51,7 +51,7 @@ MY_EXERCISES = os.environ.get(
 MOUSE_SPEED = "-0.5"   # GNOME scale -1..1, 0 = default; -0.5 = half way to slowest
 # Pinned first, in this order; anything already pinned stays after them.
 # Each entry lists alternatives: the terminal is Ptyxis on AlmaLinux 10.
-PINNED_APPS = [["firefox.desktop"], ["code.desktop"],
+PINNED_APPS = [["firefox.desktop"], ["code.desktop", "com.microsoft.VSCode.desktop", "codium.desktop"],
                ["org.gnome.Terminal.desktop", "org.gnome.Ptyxis.desktop", "org.gnome.Console.desktop"],
                ["org.gnome.Nautilus.desktop"]]
 MARIONETTE_PORT = 2828
@@ -814,7 +814,9 @@ def open_vscode():
         name = os.path.basename(d)
         main = [f for f in javas if f == name + ".java"] or javas[:1]
         files += [os.path.join(d, f) for f in main]
-    cmd = code + ["--new-window", folder] + files[:2]
+    # basic password store: VS Code never asks to unlock GNOME's login keyring
+    # (lab home folders are wiped each login, so it would ask every time)
+    cmd = code + ["--new-window", "--password-store=basic", folder] + files[:2]
     try:
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True, cwd=folder)
