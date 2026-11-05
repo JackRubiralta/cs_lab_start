@@ -11,16 +11,18 @@ main() {
     # runs the copy that's here. .env and logs/ are never touched.
     if [ "$1" = "--no-update" ]; then
         shift
-    elif [ -d "$dir/.git" ] && command -v git >/dev/null; then
-        timeout 10 git -C "$dir" pull --ff-only --quiet >/dev/null 2>&1
+    elif [ -d "$dir/.git" ] && command -v git >/dev/null \
+            && timeout 10 git -C "$dir" pull --ff-only --quiet >/dev/null 2>&1; then
+        :   # a clone that pulled cleanly
     elif command -v curl >/dev/null && command -v tar >/dev/null && tmp="$(mktemp -d)"; then
+        # no git, or the pull failed (e.g. files copied over a clone): download instead
         new="$tmp/cs_lab_start-main"
         if timeout 15 curl -fsL "$repo/archive/refs/heads/main.tar.gz" -o "$tmp/main.tar.gz" \
             && tar -xzf "$tmp/main.tar.gz" -C "$tmp" \
             && [ -f "$new/lab_start.py" ] && [ -f "$new/start" ] \
             && python3 -m py_compile "$new/lab_start.py" "$new/vtscreen.py" "$new/marionette.py" 2>/dev/null; then
             rm -rf "$new/.env" "$new/logs" "$new/__pycache__"
-            if ! diff -rq -x .env -x logs -x __pycache__ "$new" "$dir" >/dev/null 2>&1; then
+            if ! diff -rq -x .env -x logs -x __pycache__ -x .git "$new" "$dir" >/dev/null 2>&1; then
                 cp -rf --remove-destination "$new/." "$dir/" && echo "(cs_lab_start updated to the newest version)"
             fi
         fi
