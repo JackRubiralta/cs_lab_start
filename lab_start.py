@@ -774,9 +774,23 @@ def find_code():
     return None
 
 
+def exercise_folder(week_dir, srcdirs):
+    """The folder you write the newest exercise in: WNN/WNNExercises (the tests' srcdir).
+    Several parts with their own folders -> the week folder, so all of them show."""
+    found = []
+    for sd in srcdirs or sorted(os.listdir(week_dir)):
+        d = os.path.join(week_dir, sd)
+        if os.path.isdir(d) and sd not in ("css", "images", "Tests") and d not in found:
+            found.append(d)
+    if len(found) == 1:
+        return found[0], found
+    return week_dir, found
+
+
 def open_vscode():
-    """Open VS Code on the newest week, with its main .java file in front.
-    The week folder is the workspace, so VS Code's terminal starts where stacscheck wants."""
+    """Open VS Code in the newest exercise's code folder (~/Documents/CS1002/Exercises/
+    WNN/WNNExercises) with its main .java file in front. VS Code's terminal starts
+    there, and stacscheck /cs/studres/CS1002/Exercises/WNN/Tests works from it."""
     head("VS Code")
     week_dir, srcdirs = latest_week_dir()
     if not week_dir:
@@ -786,25 +800,31 @@ def open_vscode():
     if not code:
         say("  VS Code not found on this PC, skipped")
         return False
+    try:
+        folder, code_dirs = exercise_folder(week_dir, srcdirs)
+    except OSError as e:
+        say("  can't read %s (%s)" % (week_dir, _why(e)))
+        return False
     files = []
-    for sd in srcdirs or sorted(os.listdir(week_dir)):
-        d = os.path.join(week_dir, sd)
-        if not os.path.isdir(d):
-            continue
+    for d in code_dirs:
         try:
             javas = sorted(f for f in os.listdir(d) if f.endswith(".java"))
         except OSError:
             continue
-        main = [f for f in javas if f == sd + ".java"] or javas[:1]
+        name = os.path.basename(d)
+        main = [f for f in javas if f == name + ".java"] or javas[:1]
         files += [os.path.join(d, f) for f in main]
-    cmd = code + ["--new-window", week_dir] + files[:2]
+    cmd = code + ["--new-window", folder] + files[:2]
     try:
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True, cwd=week_dir)
+                         stderr=subprocess.DEVNULL, start_new_session=True, cwd=folder)
     except OSError as e:
         say("  couldn't start VS Code: %s" % _why(e))
         return False
-    say("  opened %s%s" % (week_dir, (" (" + ", ".join(os.path.basename(f) for f in files[:2]) + ")") if files else ""))
+    week = os.path.basename(week_dir)
+    say("  opened %s%s" % (folder, (" (" + ", ".join(os.path.basename(f) for f in files[:2]) + ")") if files else ""))
+    say("  test it from VS Code's terminal (Ctrl+`):")
+    say("    stacscheck %s" % os.path.join(STUDRES_EXERCISES, week, "Tests"))
     return True
 
 

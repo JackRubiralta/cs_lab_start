@@ -1,8 +1,32 @@
 #!/bin/bash
 # Set up this CS lab PC: taskbar, mouse, check-in, exercises, VS Code, Firefox. See README.md.
-dir="$(dirname "$(readlink -f "$0")")"
-# Get the newest version first (never blocks for long; offline = run what we have).
-if [ -d "$dir/.git" ] && command -v git >/dev/null; then
-    timeout 10 git -C "$dir" pull --ff-only --quiet >/dev/null 2>&1 || true
-fi
-exec python3 "$dir/lab_start.py" "$@"
+# Everything is inside main() so bash has read the whole file before the update
+# below can replace it.
+main() {
+    local dir repo tmp new
+    dir="$(dirname "$(readlink -f "$0")")"
+    repo="https://github.com/JackRubiralta/cs_lab_start"
+
+    # Newest version first. Never blocks for long; offline (or anything odd) just
+    # runs the copy that's here. .env and logs/ are never touched.
+    if [ "$1" = "--no-update" ]; then
+        shift
+    elif [ -d "$dir/.git" ] && command -v git >/dev/null; then
+        timeout 10 git -C "$dir" pull --ff-only --quiet >/dev/null 2>&1
+    elif command -v curl >/dev/null && command -v tar >/dev/null && tmp="$(mktemp -d)"; then
+        new="$tmp/cs_lab_start-main"
+        if timeout 15 curl -fsL "$repo/archive/refs/heads/main.tar.gz" -o "$tmp/main.tar.gz" \
+            && tar -xzf "$tmp/main.tar.gz" -C "$tmp" \
+            && [ -f "$new/lab_start.py" ] && [ -f "$new/start" ] \
+            && python3 -m py_compile "$new/lab_start.py" "$new/vtscreen.py" "$new/marionette.py" 2>/dev/null; then
+            rm -rf "$new/.env" "$new/logs" "$new/__pycache__"
+            if ! diff -rq -x .env -x logs -x __pycache__ "$new" "$dir" >/dev/null 2>&1; then
+                cp -rf --remove-destination "$new/." "$dir/" && echo "(cs_lab_start updated to the newest version)"
+            fi
+        fi
+        rm -rf "$tmp"
+    fi
+
+    exec python3 "$dir/lab_start.py" "$@"
+}
+main "$@"

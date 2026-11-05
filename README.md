@@ -8,7 +8,7 @@ exercise class:
 | **desktop** | Keeps the taskbar always shown, pins Firefox, VS Code, Terminal and Files, and sets the mouse to half speed |
 | **checkin** | Runs the attendance check-in `/cs/studres/ct/lab-checkin`. It selects the open session, presses `y`, then `q`. If it can't finish by itself, it opens the check-in right in the terminal for you to press Enter, `y`, `q`, so it never just sits there |
 | **exercises** | Copies every CS1002 exercise week from `/cs/studres/CS1002/Exercises` into `~/Documents/CS1002/Exercises`. **Never replaces a file that's already there**, so your answers are safe and only new weeks or missing files are added. A file, zip or folder StudRes won't let you read is listed and skipped, never a crash |
-| **vscode** | Opens VS Code on the newest week (`~/Documents/CS1002/Exercises/W08`) with its main `.java` file in front. The week folder is the workspace, so VS Code's terminal already starts where `stacscheck` wants |
+| **vscode** | Opens VS Code in the newest exercise's code folder (`~/Documents/CS1002/Exercises/W08/W08Exercises`) with its main `.java` file in front, and prints the test command. VS Code's terminal starts there, and `stacscheck /cs/studres/CS1002/Exercises/W08/Tests` works from it |
 | **browser** | Opens Firefox with exactly three tabs (StudRes CS1002, Outlook, MMS CS1002) and signs in with your University account. You only type the Authenticator number on your phone |
 
 No sudo and no installs: it uses only Python's standard library and the
@@ -62,13 +62,13 @@ terminal stays so you can read why. `--keep-terminal` always keeps it.
 
 ## Updates
 
-`./start` pulls the newest version from GitHub first (10 s at most; offline
-it just runs the copy it has). A copy downloaded without git updates with:
+`./start` gets the newest version from GitHub first, with git if the folder
+is a clone, otherwise by downloading it (15 s at most; offline it just runs
+the copy it has). `.env` and `logs/` are never touched. `./start --no-update`
+skips it. A copy older than 5 Nov 2026 can't update itself yet; once:
 
 ```bash
-cd ~/Documents && rm -rf cs_lab_start.old && mv cs_lab_start cs_lab_start.old
-curl -sL https://github.com/JackRubiralta/cs_lab_start/archive/refs/heads/main.tar.gz | tar xz
-mv cs_lab_start-main cs_lab_start && cp cs_lab_start.old/.env cs_lab_start/
+cd ~/Documents && curl -sL https://github.com/JackRubiralta/cs_lab_start/archive/refs/heads/main.tar.gz | tar xz && cp -r cs_lab_start-main/. cs_lab_start/ && rm -rf cs_lab_start-main
 ```
 
 ## Where the exercise files go
