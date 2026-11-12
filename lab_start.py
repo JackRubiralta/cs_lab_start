@@ -251,13 +251,13 @@ def setup_desktop():
     if not shutil.which("gsettings"):
         warn("gsettings not found: not a GNOME desktop, skipped")
         return False
-    ok = True
+    all_ok = True
 
     if gs_set("org.gnome.desktop.peripherals.mouse", "speed", MOUSE_SPEED):
         ok("mouse speed set to half (%s)" % MOUSE_SPEED)
     else:
         warn("could not set the mouse speed")
-        ok = False
+        all_ok = False
 
     gs_set("org.gnome.shell", "disable-user-extensions", "false")
     exts = extension_dirs()
@@ -288,7 +288,7 @@ def setup_desktop():
         ok("taskbar: " + taskbar)
     else:
         warn("no taskbar extension installed on this PC (have: %s)" % ", ".join(sorted(exts)))
-        ok = False
+        all_ok = False
 
     wanted = [next((a for a in alts if desktop_file_exists(a)), None) for alts in PINNED_APPS]
     wanted = [a for a in wanted if a]
@@ -297,7 +297,7 @@ def setup_desktop():
     if apps and gs_set("org.gnome.shell", "favorite-apps",
                        "[" + ", ".join("'%s'" % a for a in apps) + "]"):
         ok("pinned first: " + ", ".join(a.replace(".desktop", "") for a in wanted))
-    return ok
+    return all_ok
 
 
 def desktop_file_exists(name):
@@ -888,6 +888,10 @@ VSCODE_SETTINGS = {
     "files.autoSave": "afterDelay",                          # save as you type
     "workbench.welcomePage.experimentalOnboarding": False,   # no "Sign in to use Copilot" pop-up
     "workbench.startupEditor": "none",                       # your .java file in front, no Welcome tab
+    "redhat.telemetry.enabled": False,                       # no "Help Red Hat improve…" pop-up
+    # cs1002.jar sits next to the .java files, not in lib/: without this the Java
+    # extension can't see it and underlines every Burger/Mug etc. as an error
+    "java.project.referencedLibraries": ["lib/**/*.jar", "*.jar", "**/*.jar"],
 }
 # The Java pack VS Code itself offers for .java files: language support, debugger,
 # test runner, Maven, project manager.
@@ -1079,8 +1083,8 @@ def open_vscode():
         except OSError:
             continue
         name = os.path.basename(d)
-        main = [f for f in javas if f == name + ".java"] or javas[:1]
-        files += [os.path.join(d, f) for f in main]
+        main_java = [f for f in javas if f == name + ".java"] or javas[:1]
+        files += [os.path.join(d, f) for f in main_java]
     # basic password store: VS Code never asks to unlock GNOME's login keyring
     # (lab home folders are wiped each login, so it would ask every time)
     cmd = code + ["--new-window", "--password-store=basic", folder] + files[:2]
@@ -1300,10 +1304,10 @@ def act(m, page, kind, email, password, state):
     if kind == "email":
         if not email:
             raise LoginFailed("no EMAIL in %s" % ENV_FILE)
-        box = m.find('input[name="loginfmt"]')
+        field = m.find('input[name="loginfmt"]')
         if not page.get("filled"):
-            m.clear(box)
-            m.send_keys(box, email)
+            m.clear(field)
+            m.send_keys(field, email)
         submit(m)
         ok("email entered")
     elif kind == "password":
@@ -1313,9 +1317,9 @@ def act(m, page, kind, email, password, state):
             raise LoginFailed("the password page came back – check PASSWORD in .env "
                               "(stopped so your account doesn't get locked)")
         state["password_tries"] = state.get("password_tries", 0) + 1
-        box = m.find('input[name="passwd"]') or m.find('input[type="password"]')
-        m.clear(box)
-        m.send_keys(box, password)
+        field = m.find('input[name="passwd"]') or m.find('input[type="password"]')
+        m.clear(field)
+        m.send_keys(field, password)
         submit(m)
         ok("password entered")
     elif kind == "number":
@@ -1444,7 +1448,7 @@ def setup_browser(login=True):
         return False
     quiet_first_run(m)
 
-    ok = True
+    all_ok = True
     state = {}
     try:
         start_handles = m.handles()
@@ -1461,7 +1465,7 @@ def setup_browser(login=True):
                     ok("%s signed in" % bold(name))
                 except LoginFailed as e:
                     bad("%s NOT signed in – %s" % (bold(name), e))
-                    ok = False
+                    all_ok = False
                     login = False   # don't hammer the login page from the other tabs
         heal_tabs(m, mine, [u for _, u in urls], state)
         # Close anything else (welcome page, privacy notice, old tabs).
@@ -1473,11 +1477,11 @@ def setup_browser(login=True):
         m.switch_to(mine[0])
     except (MarionetteError, OSError) as e:
         bad("lost control of Firefox (closed?): %s" % e)
-        ok = False
+        all_ok = False
     finally:
         m.delete_session()   # ends remote control; Firefox stays open
         m.close()
-    return ok
+    return all_ok
 
 
 # ============================================================ close terminal
@@ -1536,9 +1540,9 @@ def main():
                     help="checkin: keep retrying for MIN minutes if no session is open yet")
     args = ap.parse_args()
     known = ["desktop", "checkin", "exercises", "vscode", "browser"]
-    bad = [p for p in args.parts if p not in known]
-    if bad:
-        ap.error("unknown part %s (choose from %s)" % (", ".join(bad), ", ".join(known)))
+    unknown = [p for p in args.parts if p not in known]
+    if unknown:
+        ap.error("unknown part %s (choose from %s)" % (", ".join(unknown), ", ".join(known)))
     parts = args.parts or known
 
     steps = {
