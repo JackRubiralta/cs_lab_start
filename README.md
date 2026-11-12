@@ -8,10 +8,10 @@ exercise class:
 | **desktop** | Keeps the taskbar always shown, pins Firefox, VS Code, Terminal and Files, and sets the mouse to half speed |
 | **checkin** | Runs the attendance check-in `/cs/studres/ct/lab-checkin`. It selects the open session, presses `y`, then `q`. If it can't finish by itself, it opens the check-in right in the terminal for you to press Enter, `y`, `q`, so it never just sits there |
 | **exercises** | Copies every CS1002 exercise week from `/cs/studres/CS1002/Exercises` into `~/Documents/CS1002/Exercises`. **Never replaces a file that's already there**, so your answers are safe and only new weeks or missing files are added. A file, zip or folder StudRes won't let you read is listed and skipped, never a crash |
-| **vscode** | Opens VS Code in the newest exercise's code folder (`~/Documents/CS1002/Exercises/W08/W08Exercises`) with its main `.java` file in front, and prints the test command. VS Code's terminal starts there, and `stacscheck /cs/studres/CS1002/Exercises/W08/Tests` works from it |
+| **vscode** | Sets VS Code up the way it should be on every fresh login: **auto save on**, everything in `~/Documents` **trusted** (no "Do you trust the authors?" pop-up), no Copilot sign-in pop-up and no Welcome tab. Installs the **Java Extension Pack** (`vscjava.vscode-java-pack`, the one VS Code offers for `.java` files: language support, debugger, tests). Then opens VS Code in the newest exercise's code folder (`~/Documents/CS1002/Exercises/W08/W08Exercises`) with its main `.java` file in front, and prints the test command. VS Code's terminal starts there, and `stacscheck /cs/studres/CS1002/Exercises/W08/Tests` works from it |
 | **browser** | Opens Firefox with exactly three tabs (StudRes CS1002, Outlook, MMS CS1002) and signs in with your University account. You only type the Authenticator number on your phone |
 
-No sudo and no installs: it uses only Python's standard library and the
+No sudo and no system installs (the only download is the VS Code Java Extension Pack, into your own home): it uses only Python's standard library and the
 Firefox that's already on the PC. Lab PCs wipe everything outside
 `~/Documents` when they restart, so it lives in `~/Documents` and you run it
 again after each login.
@@ -41,8 +41,14 @@ never committed (`.gitignore`). Nothing ever prints or logs the password.
 ## Every class
 
 ```bash
-~/Documents/cs_lab_start/start
+cd Documents
+./x
 ```
+
+`./start` makes `~/Documents/x` the first time it runs: a two-line shortcut to
+`cs_lab_start/start`, so from `Documents` you never need to `cd` into the
+folder. (`~/Documents/x` or `~/Documents/cs_lab_start/start` work from
+anywhere.) It never replaces an `x` you made yourself.
 
 When Microsoft asks for the Authenticator code, the number appears in the
 terminal (and as a notification). Type it into the app on your phone.
@@ -53,7 +59,7 @@ terminal stays so you can read why. `--keep-terminal` always keeps it.
 
 | Command | |
 |---|---|
-| `./start` | everything, then closes the terminal if it all worked |
+| `./start` (or `./x` from Documents) | everything, then closes the terminal if it all worked |
 | `./start checkin` | just the check-in. `--wait 15` keeps retrying for 15 minutes if you're early (check-in opens 10 minutes before the class). `--manual` opens it for you to press the keys |
 | `./start exercises` | just the new exercise files. `--dry-run` shows what it would copy |
 | `./start vscode` | just VS Code on the newest week |

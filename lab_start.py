@@ -8,8 +8,9 @@
                 opens the check-in in this terminal for you
   3. exercises  copy every new CS1002 exercise week from /cs/studres into
                 ~/Documents/CS1002/Exercises (never overwrites a file)
-  4. vscode     VS Code on the newest week, main .java file open, terminal
-                already in the folder stacscheck runs from
+  4. vscode     auto save on, Java Extension Pack installed, then VS Code on
+                the newest week, main .java file open, terminal already in
+                the folder stacscheck runs from
   5. browser    Firefox with StudRes CS1002, Outlook and MMS CS1002 open and
                 signed in (email + password from .env; you approve the
                 Authenticator number on your phone)
@@ -24,8 +25,10 @@ on restart, so this lives in ~/Documents and re-applies itself every login.
 """
 
 import argparse
+import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -89,8 +92,113 @@ def say(msg=""):
         pass
 
 
+# ---------------------------------------------------------------- looks
+def _want_colour():
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+COLOUR = _want_colour()
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+WIDTH = 64
+
+
+def _c(code, text):
+    return "\033[%sm%s\033[0m" % (code, text) if COLOUR else text
+
+
+def bold(t): return _c("1", t)
+def dim(t): return _c("2", t)
+def green(t): return _c("32", t)
+def red(t): return _c("31", t)
+def yellow(t): return _c("33", t)
+def cyan(t): return _c("36", t)
+
+
+def ok(msg): say("  " + green("✓") + " " + msg)
+def warn(msg): say("  " + yellow("!") + " " + msg)
+def bad(msg): say("  " + red("✗") + " " + msg)
+def info(msg): say("  " + cyan("›") + " " + msg)
+def hint(msg): say("    " + dim(msg))
+def show_cmd(cmd): say("    " + cyan("$") + " " + bold(cmd))
+def detail(line): say("    " + dim("│") + " " + line)
+
+
+def box(lines, colour="36", width=WIDTH):
+    """A rounded box; lines may hold colour codes (padding counts only visible text)."""
+    inner = max([width - 4] + [len(ANSI_RE.sub("", l)) for l in lines])
+    edge = lambda t: _c(colour, t)
+    say("  " + edge("╭" + "─" * (inner + 2) + "╮"))
+    for l in lines:
+        pad = inner - len(ANSI_RE.sub("", l))
+        say("  " + edge("│") + " " + l + " " * pad + " " + edge("│"))
+    say("  " + edge("╰" + "─" * (inner + 2) + "╯"))
+
+
+STEP = {"n": 0, "of": 0}
+
+
 def head(title):
-    say("\n== " + title)
+    """Step header: ━━ 2/5  Lab check-in ─────────"""
+    tag = ""
+    if STEP["of"]:
+        STEP["n"] += 1
+        tag = "%d/%d  " % (STEP["n"], STEP["of"])
+    rule = "─" * max(3, WIDTH - len(tag) - len(title) - 5)
+    say("")
+    say(_c("1;36", "━━ ") + _c("2;36", tag) + bold(title) + " " + dim(rule))
+
+
+def banner():
+    when = time.strftime("%a %d %b · %H:%M")
+    host = socket.gethostname().split(".")[0]
+    box([bold("cs_lab_start") + dim("  ·  ") + "CS1002 lab setup",
+         dim("%s  ·  %s  ·  %s" % (when, host, os.environ.get("USER", "")))])
+
+
+class Spinner:
+    """'⠋ installing … 12s' on one line while a slow job runs (plain text when not a terminal)."""
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, msg):
+        self.msg, self.stop, self.t = msg, None, None
+
+    def __enter__(self):
+        if not COLOUR:
+            info(self.msg + "…")
+            return self
+        import threading
+        self.stop = threading.Event()
+        start = time.time()
+
+        def spin():
+            i = 0
+            while not self.stop.wait(0.1):
+                frame = cyan(self.FRAMES[i % len(self.FRAMES)])
+                try:
+                    sys.stdout.write("\r\033[K  %s %s %s" % (frame, self.msg, dim("%ds" % (time.time() - start))))
+                    sys.stdout.flush()
+                except (OSError, ValueError):
+                    return
+                i += 1
+        self.t = threading.Thread(target=spin, daemon=True)
+        self.t.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self.stop:
+            self.stop.set()
+            self.t.join()
+            try:
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+        return False
 
 
 def run(cmd, **kw):
@@ -141,14 +249,14 @@ def schemadir_for(ext_dir):
 def setup_desktop():
     head("Desktop")
     if not shutil.which("gsettings"):
-        say("  gsettings not found: not a GNOME desktop, skipped")
+        warn("gsettings not found: not a GNOME desktop, skipped")
         return False
     ok = True
 
     if gs_set("org.gnome.desktop.peripherals.mouse", "speed", MOUSE_SPEED):
-        say("  mouse speed set to half (%s)" % MOUSE_SPEED)
+        ok("mouse speed set to half (%s)" % MOUSE_SPEED)
     else:
-        say("  could not set the mouse speed")
+        warn("could not set the mouse speed")
         ok = False
 
     gs_set("org.gnome.shell", "disable-user-extensions", "false")
@@ -177,9 +285,9 @@ def setup_desktop():
         gs_set("org.gnome.shell.extensions.window-list", "show-on-all-monitors", "true")
         taskbar = "bottom window list, always shown"
     if taskbar:
-        say("  taskbar: " + taskbar)
+        ok("taskbar: " + taskbar)
     else:
-        say("  no taskbar extension installed on this PC (have: %s)" % ", ".join(sorted(exts)))
+        warn("no taskbar extension installed on this PC (have: %s)" % ", ".join(sorted(exts)))
         ok = False
 
     wanted = [next((a for a in alts if desktop_file_exists(a)), None) for alts in PINNED_APPS]
@@ -188,7 +296,7 @@ def setup_desktop():
     apps = wanted + [a for a in current if a not in wanted]
     if apps and gs_set("org.gnome.shell", "favorite-apps",
                        "[" + ", ".join("'%s'" % a for a in apps) + "]"):
-        say("  pinned first: " + ", ".join(a.replace(".desktop", "") for a in wanted))
+        ok("pinned first: " + ", ".join(a.replace(".desktop", "") for a in wanted))
     return ok
 
 
@@ -370,7 +478,7 @@ def _drive(wait_minutes, timeout, log):
                 if now < wait_until:
                     if now - last_retry > 30:
                         if not last_retry:
-                            say("  no session open yet; trying again every 30 s (Ctrl-C to stop)")
+                            info("no session open yet; trying again every 30 s (Ctrl-C to stop)")
                         last_retry = now
                         deadline = max(deadline, now + 60)
                         press(b"r", "r (try again)")
@@ -453,7 +561,7 @@ def lab_checkin(wait_minutes=0, timeout=90, manual=False):
     the check-in right here for you to press the keys, so it never just hangs."""
     head("Lab check-in")
     if not os.access(LAB_CHECKIN, os.X_OK):
-        say("  %s not found (not on a lab PC?), skipped" % LAB_CHECKIN)
+        warn("%s not found (not on a lab PC?), skipped" % LAB_CHECKIN)
         return False
     log_path, log = _open_log()
     try:
@@ -466,43 +574,43 @@ def lab_checkin(wait_minutes=0, timeout=90, manual=False):
 
         if outcome == "recorded":
             m = re.search(r"\b([A-Z]{2}\d{4})\b.*?(on time|\d+m \d+s after start|\d+s after start|early|late)", flat)
-            say("  CHECKED IN" + (" – %s, %s" % (m.group(1), m.group(2)) if m else ""))
+            ok(bold(green("CHECKED IN")) + (" – %s, %s" % (m.group(1), m.group(2)) if m else ""))
             return True
         if outcome == "none open":
-            say("  no attendance session open right now (it opens 10 minutes before the class)")
-            say("  run ./start checkin again closer to the start, or ./start checkin --wait 15")
+            warn("no attendance session open right now (it opens 10 minutes before the class)")
+            hint("run ./start checkin again closer to the start, or ./start checkin --wait 15")
             return False
         if outcome == "failed":
             m = re.search(r"CHECK-IN FAILED\s*(.{0,200}?)\s*(Retrying|r retry|q quit|$)", flat)
-            say("  check-in FAILED: %s" % (m.group(1).strip() if m else "see below"))
+            bad("check-in FAILED: %s" % (m.group(1).strip() if m else "see below"))
             for line in _screen_lines(text):
-                say("    | " + line[:150])
+                detail(line[:150])
             return False
         if outcome == "exited" and text.strip():
-            say("  lab-checkin stopped by itself:")
+            bad("lab-checkin stopped by itself:")
             for line in _screen_lines(text):
-                say("    | " + line[:150])
+                detail(line[:150])
             if "workstation metadata" in flat or "logind" in flat:
-                say("  (it needs the lab PC's own desktop login – not ssh or su)")
+                hint("(it needs the lab PC's own desktop login – not ssh or su)")
             return False
 
         # Stuck on a screen we can't read, or keys not landing: give it to Jack.
         if not manual:
-            say("  couldn't finish it by itself (keys sent: %s). Last screen:" % (", ".join(sent) or "none"))
+            bad("couldn't finish it by itself (keys sent: %s). Last screen:" % (", ".join(sent) or "none"))
             for line in _screen_lines(text):
-                say("    | " + line[:150])
+                detail(line[:150])
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            say("  run %s by hand: Enter, then y, then q" % LAB_CHECKIN)
+            hint("run %s by hand: Enter, then y, then q" % LAB_CHECKIN)
             return False
-        say("  opening the check-in here – press Enter, then y, then q")
+        info("opening the check-in here – press Enter, then y, then q")
         time.sleep(1.5)
         recorded, text = _interactive(log)
-        say("  CHECKED IN" if recorded else "  check-in closed without CHECK-IN RECORDED")
+        ok(bold(green("CHECKED IN"))) if recorded else bad("check-in closed without CHECK-IN RECORDED")
         return recorded
     finally:
         if log:
             log.close()
-            say("  (screen log: %s)" % os.path.relpath(log_path, HERE))
+            hint("(screen log: %s)" % os.path.relpath(log_path, HERE))
 
 
 # ================================================================ exercises
@@ -645,7 +753,7 @@ def sync_exercises(dry_run=False):
         weeks = sorted((w for w in os.listdir(STUDRES_EXERCISES) if WEEK_RE.match(w)),
                        key=lambda w: int(w[1:]))
     except OSError as e:
-        say("  can't read %s (%s) – not on a lab PC?, skipped" % (STUDRES_EXERCISES, _why(e)))
+        warn("can't read %s (%s) – not on a lab PC?, skipped" % (STUDRES_EXERCISES, _why(e)))
         return False
     copied, kept, failed = [], 0, []
     newest_tests = None
@@ -715,28 +823,28 @@ def sync_exercises(dry_run=False):
 
     verb = "would copy" if dry_run else "copied"
     if copied:
-        say("  %s %d new file(s) into %s:" % (verb, len(copied), MY_EXERCISES))
+        ok("%s %d new file(s) into %s:" % (verb, len(copied), MY_EXERCISES))
         for c in copied[:40]:
-            say("    + " + c)
+            say("    " + green("+") + " " + c)
         if len(copied) > 40:
-            say("    … and %d more" % (len(copied) - 40))
+            hint("… and %d more" % (len(copied) - 40))
     else:
-        say("  up to date (%s)" % MY_EXERCISES)
-    say("  %d existing file(s) left untouched" % kept)
+        ok("up to date (%s)" % MY_EXERCISES)
+    info("%d existing file(s) left untouched" % kept)
     if failed:
-        say("  skipped %d thing(s) StudRes wouldn't let me read (everything else is copied):" % len(failed))
+        warn("skipped %d thing(s) StudRes wouldn't let me read (everything else is copied):" % len(failed))
         for f in failed[:10]:
-            say("    ! " + f)
+            say("    " + yellow("!") + " " + f)
         if len(failed) > 10:
-            say("    … and %d more" % (len(failed) - 10))
+            hint("… and %d more" % (len(failed) - 10))
     if newest_tests:
         week, tests = newest_tests
         LATEST["week"], LATEST["srcdirs"] = week, [s for _, s in tests]
-        say("  test %s with:" % week)
-        say("    cd %s" % os.path.join(MY_EXERCISES, week))
+        info("test %s with:" % week)
+        show_cmd("cd %s" % os.path.join(MY_EXERCISES, week))
         for tdir, _ in tests:
             if os.path.basename(tdir) == "Tests" or len(tests) == 1:
-                say("    stacscheck %s" % tdir)
+                show_cmd("stacscheck %s" % tdir)
     # Copying most of it is a success; skipped files are reported above.
     return bool(weeks) and (bool(copied) or kept > 0 or not failed)
 
@@ -774,6 +882,147 @@ def find_code():
     return None
 
 
+# VS Code settings this applies every login (the local home, and with it
+# ~/.config/Code, is wiped on restart). Keys already set to something else are kept.
+VSCODE_SETTINGS = {
+    "files.autoSave": "afterDelay",                          # save as you type
+    "workbench.welcomePage.experimentalOnboarding": False,   # no "Sign in to use Copilot" pop-up
+    "workbench.startupEditor": "none",                       # your .java file in front, no Welcome tab
+}
+# The Java pack VS Code itself offers for .java files: language support, debugger,
+# test runner, Maven, project manager.
+JAVA_PACK = "vscjava.vscode-java-pack"
+INSTALL_TIMEOUT = 240
+
+
+def vscode_user_dir(code):
+    """VS Code's User folder (settings.json, globalStorage/) for Code, VSCodium,
+    Code - OSS or the flatpak."""
+    joined = " ".join(code or [])
+    if "com.visualstudio.code" in joined:
+        return os.path.expanduser("~/.var/app/com.visualstudio.code/config/Code/User")
+    exe = os.path.basename(code[-1]) if code else "code"
+    app = {"codium": "VSCodium", "code-oss": "Code - OSS"}.get(exe, "Code")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, app, "User")
+
+
+# Folders VS Code trusts without asking ("Do you trust the authors…?"). Trust covers
+# every folder inside. ~/Documents is a link to the network home on lab PCs, so the
+# real path is trusted too.
+TRUST_KEY = "content.trust.model.key"
+
+
+def trusted_roots():
+    docs = os.path.expanduser("~/Documents")
+    roots = [docs]
+    real = os.path.realpath(docs)
+    if real != docs:
+        roots.append(real)
+    return roots
+
+
+def trust_folders(db_path, folders):
+    """Add folders to VS Code's trusted list (its state database, where "Trust the
+    authors" saves them). Returns the ones it added; existing entries are kept."""
+    import sqlite3
+    from urllib.parse import quote
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
+        row = con.execute("SELECT value FROM ItemTable WHERE key = ?", (TRUST_KEY,)).fetchone()
+        model = {}
+        if row:
+            try:
+                raw = row[0].decode() if isinstance(row[0], bytes) else row[0]
+                model = json.loads(raw) or {}
+            except (ValueError, UnicodeDecodeError):
+                model = {}
+        if not isinstance(model, dict):
+            model = {}
+        entries = model.get("uriTrustInfo")
+        if not isinstance(entries, list):
+            entries = []
+        have = set()
+        for e in entries:
+            uri = e.get("uri") if isinstance(e, dict) else None
+            if isinstance(uri, dict) and e.get("trusted") and uri.get("scheme", "file") == "file":
+                have.add((uri.get("path") or "").rstrip("/"))
+        added = []
+        for f in folders:
+            path = os.path.abspath(f).rstrip("/") or "/"
+            if path in have or path in added:
+                continue
+            entries.append({"uri": {"$mid": 1, "fsPath": path, "external": "file://" + quote(path),
+                                    "path": path, "scheme": "file"}, "trusted": True})
+            added.append(path)
+        if added:
+            model["uriTrustInfo"] = entries
+            con.execute("INSERT INTO ItemTable (key, value) VALUES (?, ?)", (TRUST_KEY, json.dumps(model)))
+            con.commit()
+        return added
+    finally:
+        con.close()
+
+
+def apply_vscode_settings(path, wanted=None):
+    """Add VSCODE_SETTINGS to settings.json. Returns the keys it set.
+    A settings.json it can't parse (comments, typos) is left alone."""
+    wanted = VSCODE_SETTINGS if wanted is None else wanted
+    settings = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            settings = json.loads(text) if text.strip() else {}
+        except (OSError, ValueError):
+            return None
+        if not isinstance(settings, dict):
+            return None
+    changed = [k for k, v in wanted.items() if k not in settings]
+    if not changed:
+        return []
+    for k in changed:
+        settings[k] = wanted[k]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=4)
+        f.write("\n")
+    os.replace(tmp, path)
+    return changed
+
+
+def install_java_pack(code):
+    """Install the Java Extension Pack unless it's already there. True when installed."""
+    try:
+        r = subprocess.run(code + ["--list-extensions"], capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+        if JAVA_PACK in r.stdout.lower().split():
+            ok("Java Extension Pack already installed")
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with Spinner("installing the Java Extension Pack (once per login, about a minute)"):
+            r = subprocess.run(code + ["--install-extension", JAVA_PACK, "--force"],
+                               capture_output=True, text=True, timeout=INSTALL_TIMEOUT,
+                               stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        warn("Java Extension Pack still installing after %d s, opening VS Code anyway" % INSTALL_TIMEOUT)
+        return False
+    except OSError as e:
+        bad("couldn't install the Java Extension Pack: %s" % _why(e))
+        return False
+    if r.returncode == 0:
+        ok("Java Extension Pack installed")
+        return True
+    last = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["exit %d" % r.returncode]
+    bad("Java Extension Pack didn't install: %s" % last[0])
+    return False
+
+
 def exercise_folder(week_dir, srcdirs):
     """The folder you write the newest exercise in: WNN/WNNExercises (the tests' srcdir).
     Several parts with their own folders -> the week folder, so all of them show."""
@@ -794,17 +1043,35 @@ def open_vscode():
     head("VS Code")
     week_dir, srcdirs = latest_week_dir()
     if not week_dir:
-        say("  no exercise week in %s yet, skipped" % MY_EXERCISES)
+        warn("no exercise week in %s yet, skipped" % MY_EXERCISES)
         return False
     code = find_code()
     if not code:
-        say("  VS Code not found on this PC, skipped")
+        warn("VS Code not found on this PC, skipped")
         return False
     try:
         folder, code_dirs = exercise_folder(week_dir, srcdirs)
     except OSError as e:
-        say("  can't read %s (%s)" % (week_dir, _why(e)))
+        bad("can't read %s (%s)" % (week_dir, _why(e)))
         return False
+    user_dir = vscode_user_dir(code)
+    path = os.path.join(user_dir, "settings.json")
+    try:
+        changed = apply_vscode_settings(path)
+    except OSError as e:
+        changed = None
+        bad("couldn't write %s (%s)" % (path, _why(e)))
+    if changed is None:
+        warn("auto save: left %s alone (couldn't read it)" % path)
+    else:
+        ok("auto save on" + (dim(" (already set)") if not changed else ""))
+    roots = trusted_roots()
+    try:
+        trust_folders(os.path.join(user_dir, "globalStorage", "state.vscdb"), roots)
+        ok("trusted: everything in %s %s" % (roots[0], dim("(no \"trust the authors?\" pop-up)")))
+    except Exception as e:   # sqlite missing or the database locked: VS Code just asks instead
+        warn("couldn't mark %s as trusted (%s); VS Code may ask once" % (roots[0], e))
+    install_java_pack(code)
     files = []
     for d in code_dirs:
         try:
@@ -821,13 +1088,44 @@ def open_vscode():
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True, cwd=folder)
     except OSError as e:
-        say("  couldn't start VS Code: %s" % _why(e))
+        bad("couldn't start VS Code: %s" % _why(e))
         return False
     week = os.path.basename(week_dir)
-    say("  opened %s%s" % (folder, (" (" + ", ".join(os.path.basename(f) for f in files[:2]) + ")") if files else ""))
-    say("  test it from VS Code's terminal (Ctrl+`):")
-    say("    stacscheck %s" % os.path.join(STUDRES_EXERCISES, week, "Tests"))
+    ok("opened %s%s" % (folder, (" (" + ", ".join(os.path.basename(f) for f in files[:2]) + ")") if files else ""))
+    info("test it from VS Code's terminal (Ctrl+`):")
+    show_cmd("stacscheck %s" % os.path.join(STUDRES_EXERCISES, week, "Tests"))
     return True
+
+
+# ================================================================ launcher
+LAUNCHER = os.path.expanduser("~/Documents/x")
+LAUNCHER_MARK = "# cs_lab_start launcher"
+
+
+def make_launcher(path=None):
+    """~/Documents/x runs ./start, so from Documents it's just ./x. Lives in
+    ~/Documents, so it survives restarts. Never replaces someone else's x."""
+    path = path or LAUNCHER
+    if not os.path.isdir(os.path.dirname(path)):
+        return None
+    body = ("#!/bin/sh\n%s: ./x = %s/start (made by cs_lab_start)\nexec %s \"$@\"\n"
+            % (LAUNCHER_MARK, HERE, shlex.quote(os.path.join(HERE, "start"))))
+    try:
+        if os.path.lexists(path):
+            with open(path, errors="replace") as f:
+                old = f.read()
+            if LAUNCHER_MARK not in old:
+                return None          # not ours: leave it
+            if old == body and os.access(path, os.X_OK):
+                return False         # already there
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(body)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return None
 
 
 # ================================================================== browser
@@ -1007,7 +1305,7 @@ def act(m, page, kind, email, password, state):
             m.clear(box)
             m.send_keys(box, email)
         submit(m)
-        say("  email entered")
+        ok("email entered")
     elif kind == "password":
         if not password:
             raise LoginFailed("no PASSWORD in %s – fill it in and run ./start browser" % ENV_FILE)
@@ -1019,7 +1317,7 @@ def act(m, page, kind, email, password, state):
         m.clear(box)
         m.send_keys(box, password)
         submit(m)
-        say("  password entered")
+        ok("password entered")
     elif kind == "number":
         if state.get("shown") != page["number"]:   # once per code, not every poll
             state["shown"] = page["number"]
@@ -1027,19 +1325,19 @@ def act(m, page, kind, email, password, state):
     elif kind == "approve":
         if state.get("shown") != "approve":
             state["shown"] = "approve"
-            say("  approve the sign-in on your phone (Microsoft Authenticator)…")
+            info("approve the sign-in on your phone (Microsoft Authenticator)…")
             notify("Approve the sign-in in Microsoft Authenticator")
     elif kind == "kmsi":
         submit(m)   # "Stay signed in?" -> Yes (this PC forgets it on restart anyway)
-        say("  'Stay signed in?' -> Yes")
+        ok("'Stay signed in?' → Yes")
     elif kind == "picker":
         if email and m.js(CLICK_TEXT_JS, email):
-            say("  picked account " + email)
+            ok("picked account " + email)
     elif kind == "method":
         for label in ("Approve a request on my Microsoft Authenticator",
                       "Microsoft Authenticator", "Authenticator app"):
             if m.js(CLICK_TEXT_JS, label):
-                say("  chose Microsoft Authenticator")
+                ok("chose Microsoft Authenticator")
                 break
 
 
@@ -1054,7 +1352,7 @@ def reload_crashed(m, url, state, why):
     state["crashes"] = state.get("crashes", 0) + 1
     if state["crashes"] > 3:
         raise LoginFailed("the tab keeps crashing – Firefox's reason is in logs/firefox-*.log")
-    say("  the tab %s – loading it again (%d/3)" % (why, state["crashes"]))
+    warn("the tab %s – loading it again (%d/3)" % (why, state["crashes"]))
     try:
         m.navigate(url)
     except MarionetteError:
@@ -1079,14 +1377,13 @@ def heal_tabs(m, handles, urls, state):
             try:
                 reload_crashed(m, url, state, "crashed")
             except LoginFailed as e:
-                say("  " + str(e))
+                bad(str(e))
 
 
 def show_number(number):
     say("")
-    say("  ┌──────────────────────────────────────────┐")
-    say("  │  Type  %-4s into Microsoft Authenticator  │" % number)
-    say("  └──────────────────────────────────────────┘")
+    box(["", "   Type  " + _c("1;33", number) + "  into Microsoft Authenticator   ", ""],
+        colour="1;33", width=0)
     say("")
     notify("Authenticator number: " + number)
 
@@ -1126,14 +1423,14 @@ def setup_browser(login=True):
     urls = [("StudRes CS1002", STUDRES_URL), ("Outlook", OUTLOOK_URL), ("MMS CS1002", MMS_URL)]
     email, password = load_env()
     if login and not password:
-        say("  .env has no PASSWORD yet: fill in %s, then run ./start browser" % ENV_FILE)
-        say("  (opening the tabs without signing in for now)")
+        warn(".env has no PASSWORD yet: fill in %s, then run ./start browser" % ENV_FILE)
+        hint("(opening the tabs without signing in for now)")
         login = False
 
     if not port_open(MARIONETTE_PORT):
         if firefox_running():
-            say("  Firefox is already open without remote control, so it can't sign in for you.")
-            say("  Opening the tabs in it instead. For auto sign-in: close Firefox, run ./start browser")
+            warn("Firefox is already open without remote control, so it can't sign in for you.")
+            hint("Opening the tabs in it instead. For auto sign-in: close Firefox, run ./start browser")
             open_tabs_plain([u for _, u in urls])
             return False
         launch_firefox()
@@ -1142,7 +1439,7 @@ def setup_browser(login=True):
         m.connect(timeout=90)
         m.new_session()
     except (MarionetteError, OSError) as e:
-        say("  couldn't control Firefox (%s); opening the tabs plainly" % e)
+        warn("couldn't control Firefox (%s); opening the tabs plainly" % e)
         open_tabs_plain([u for _, u in urls])
         return False
     quiet_first_run(m)
@@ -1156,14 +1453,14 @@ def setup_browser(login=True):
             handle = start_handles[0] if i == 0 else m.new_tab()
             m.switch_to(handle)
             mine.append(handle)
-            say("  %s: %s" % (name, url))
+            info("%s %s" % (bold(name), dim(url)))
             m.navigate(url)
             if login:
                 try:
                     sign_in(m, url, email, password, state)
-                    say("  %s: signed in" % name)
+                    ok("%s signed in" % bold(name))
                 except LoginFailed as e:
-                    say("  %s: NOT signed in – %s" % (name, e))
+                    bad("%s NOT signed in – %s" % (bold(name), e))
                     ok = False
                     login = False   # don't hammer the login page from the other tabs
         heal_tabs(m, mine, [u for _, u in urls], state)
@@ -1175,7 +1472,7 @@ def setup_browser(login=True):
                 m.close_tab()
         m.switch_to(mine[0])
     except (MarionetteError, OSError) as e:
-        say("  lost control of Firefox (closed?): %s" % e)
+        bad("lost control of Firefox (closed?): %s" % e)
         ok = False
     finally:
         m.delete_session()   # ends remote control; Firefox stays open
@@ -1217,7 +1514,7 @@ def close_my_terminal():
     term = proc_name(proc_parent(shell))
     if not term.startswith(TERMINAL_APPS):
         return False
-    say("\n  all done – closing this terminal")
+    say("\n  " + dim("all done – closing this terminal"))
     sys.stdout.flush()
     time.sleep(2)
     os.kill(shell, signal.SIGHUP)   # the shell exits, so the terminal tab/window closes
@@ -1251,24 +1548,36 @@ def main():
         "vscode": open_vscode,
         "browser": lambda: setup_browser(login=not args.no_login),
     }
-    results = {}
+    results, took = {}, {}
+    banner()
+    if make_launcher():
+        say("  " + green("✓") + " made " + bold("~/Documents/x") + dim(" – from Documents, just run ./x"))
+    STEP["of"] = sum(1 for k in known if k in parts)
     try:
         for name in known:
             if name in parts:
+                t0 = time.time()
                 try:
                     results[name] = steps[name]()
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:   # one broken part never stops the rest
-                    say("  %s crashed: %s: %s" % (name, type(e).__name__, e))
+                    bad("%s crashed: %s: %s" % (name, type(e).__name__, e))
                     results[name] = False
+                took[name] = time.time() - t0
     except KeyboardInterrupt:
-        say("\n  stopped (Ctrl-C)")
+        say("\n  " + yellow("stopped (Ctrl-C)"))
         return 130
-    head("Done")
-    for k, v in results.items():
-        say("  %-10s %s" % (k, "ok" if v else "needs a look (see above)"))
     all_ok = all(results.values())
+    say("")
+    rows = [bold("Summary")]
+    for k, v in results.items():
+        mark = green("✓") if v else red("✗")
+        what = green("ok") if v else yellow("needs a look (see above)")
+        rows.append("%s %-10s %s  %s" % (mark, k, what, dim("%.1fs" % took.get(k, 0))))
+    rows.append(green(bold("All set – good luck in the class!")) if all_ok
+                else yellow("Some steps need a look – the messages above say why."))
+    box(rows, colour="32" if all_ok else "33")
     # Full run that worked: leave only Firefox on screen. Anything wrong: keep
     # the terminal so the messages above can be read.
     if all_ok and not args.parts and not args.keep_terminal:
