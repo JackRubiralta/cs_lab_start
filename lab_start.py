@@ -1475,13 +1475,66 @@ def setup_browser(login=True):
                 m.switch_to(h)
                 m.close_tab()
         m.switch_to(mine[0])
+        handed_back = hand_back_firefox(m)
     except (MarionetteError, OSError) as e:
         bad("lost control of Firefox (closed?): %s" % e)
         all_ok = False
+        handed_back = False
     finally:
-        m.delete_session()   # ends remote control; Firefox stays open
+        m.delete_session()   # no-op if Firefox already restarted
         m.close()
+    if handed_back:
+        ok("Firefox reopened without remote control (no stripes, no robot icon, no CAPTCHAs)")
     return all_ok
+
+
+def firefox_pids():
+    r = run(["pgrep", "-u", str(os.getuid()), "-x", "firefox|firefox-bin|firefox-esr"])
+    return [int(x) for x in r.stdout.split()] if r.returncode == 0 else []
+
+
+def hand_back_firefox(m, wait=30):
+    """Restart Firefox as a normal browser once signed in.
+
+    A Firefox started with --marionette stays remote-controlled until it quits, even
+    after the session ends: the address bar keeps its red/white stripes and robot icon,
+    and every page sees navigator.webdriver = true, which is why Google/Microsoft keep
+    showing CAPTCHAs. So: ask Firefox to restore this session once on its next start
+    (that keeps the three tabs and their sign-in cookies), quit it cleanly, and start
+    plain `firefox`. Returns True when the plain Firefox is up."""
+    try:
+        m.send("Marionette:SetContext", {"value": "chrome"})
+        m.js("""
+          Services.prefs.setBoolPref('browser.sessionstore.resume_session_once', true);
+          Services.prefs.savePrefFile(null);
+        """)
+    except MarionetteError as e:
+        warn("left Firefox remote-controlled (couldn't set session restore: %s)" % e)
+        hint("close Firefox and reopen it to get rid of the stripes; you stay signed in")
+        try:
+            m.send("Marionette:SetContext", {"value": "content"})
+        except MarionetteError:
+            pass
+        return False
+    before = firefox_pids()
+    try:
+        m.send("Marionette:Quit", {"flags": ["eAttemptQuit"]}, timeout=30)
+    except (MarionetteError, OSError):
+        pass   # the socket usually drops while Firefox shuts down
+    deadline = time.time() + wait
+    while time.time() < deadline and any(pid in firefox_pids() for pid in before):
+        time.sleep(0.5)
+    if any(pid in firefox_pids() for pid in before):
+        warn("Firefox didn't close, so it's still remote-controlled")
+        hint("close Firefox and reopen it to get rid of the stripes; you stay signed in")
+        return False
+    try:
+        log = open(os.path.join(LOG_DIR, time.strftime("firefox-%Y%m%d-%H%M%S.log")), "ab")
+    except OSError:
+        log = subprocess.DEVNULL
+    subprocess.Popen(["firefox"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     start_new_session=True)
+    return True
 
 
 # ============================================================ close terminal

@@ -127,8 +127,13 @@ a class, email yourself that file.
 
 ## How the sign-in works
 
-Firefox is started with `--marionette`, its built-in remote control. That's
-why the address bar shows a robot icon and stripes. `marionette.py` (about
+Firefox is started with `--marionette`, its built-in remote control, which
+is why the address bar shows a robot icon and stripes while it signs in.
+Once every tab is signed in, the script asks Firefox to restore this session
+once, quits it and starts a plain `firefox`. The same three tabs come back
+signed in, and the stripes and robot icon are gone. That restart matters:
+while remote control is on, every page sees `navigator.webdriver = true`, so
+Google and Microsoft treat you as a bot and keep showing CAPTCHAs. `marionette.py` (about
 150 lines) talks to it over a local socket. StudRes and MMS go through
 `login.st-andrews.ac.uk`, which hands over to Microsoft's sign-in page.
 After the first sign-in, Outlook and MMS reuse the same session. The script
